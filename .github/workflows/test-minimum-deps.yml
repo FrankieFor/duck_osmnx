@@ -37,7 +37,7 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
 
-      - name: Install OSMnx with minimum dependency versions
+      - name: Install ducknx with minimum dependency versions
         run: |
           uv python pin ${{ matrix.python-version }}
           uv sync --all-extras --group test --resolution=lowest-direct

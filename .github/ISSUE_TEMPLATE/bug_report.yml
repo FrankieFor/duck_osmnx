@@ -1,10 +1,10 @@
 name: Report a bug
-description: Report a bug in OSMnx's code
+description: Report a bug in ducknx's code
 labels: bug
 body:
   - type: markdown
     attributes:
-      value: Thanks for using OSMnx!
+      value: Thanks for using ducknx!
 
   - type: checkboxes
     id: contributing
@@ -52,7 +52,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: What OSMnx version are you using?
+      label: What ducknx version are you using?
       description: Ensure you are using the latest release.
       placeholder: e.g., v0.0.0
     validations:
@@ -72,7 +72,7 @@ body:
   - type: dropdown
     id: installation
     attributes:
-      label: How did you install OSMnx?
+      label: How did you install ducknx?
       description: |
         Ensure you followed the
         [installation](https://osmnx.readthedocs.io/en/stable/installation.html)
@@ -81,7 +81,7 @@ body:
       options:
         - conda or mamba (via conda-forge)
         - pip or uv (via PyPI)
-        - OSMnx Docker image
+        - ducknx Docker image
         - Other (describe below)
     validations:
       required: true

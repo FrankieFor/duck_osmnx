@@ -1,0 +1,77 @@
+{
+  "version": "1",
+  "metadata": {
+    "marimo_version": "0.19.9"
+  },
+  "cells": [
+    {
+      "id": "SFPL",
+      "code_hash": "b1885ebcffc9ddf6205e52c7df149ca9",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/markdown": "<span class=\"markdown prose dark:prose-invert contents\"><h2 id=\"sample-feature-data-first-10-rows\">Sample Feature Data (first 10 rows)</h2></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "Hbol",
+      "code_hash": "4b1d80db7460f965b0ad8b051594c6dc",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/markdown": "<span class=\"markdown prose dark:prose-invert contents\"><h1 id=\"duckdb-optimized-pbf-reading-test\">DuckDB-Optimized PBF Reading Test</h1>\n<span class=\"paragraph\"><strong>PBF file</strong>: <code>berlin-latest.osm.pbf</code>\n<strong>Test bbox</strong>: <code>(13.38, 52.51, 13.42, 52.53)</code> (central Berlin / Mitte)</span></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "MJUe",
+      "code_hash": "e09e2b5fd6e406e9b7acfa677ebc9554",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/markdown": "<span class=\"markdown prose dark:prose-invert contents\"><span class=\"paragraph\"><strong>Optimized path</strong> completed in <strong>3.873s</strong></span>\n<ul>\n<li>Nodes: <strong>474</strong></li>\n<li>Edges: <strong>1,115</strong></li>\n</ul></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "vblA",
+      "code_hash": "2675786cff9f0e079c6ddfc1257d64b2",
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "bkHC",
+      "code_hash": "8618504f72bc1d57cfc5c141c75baad1",
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "lEQa",
+      "code_hash": "7fa9f2758a8d39f7a53ac1203f5c2534",
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "PKri",
+      "code_hash": "b7be537d77459e8f8719e3a25163865d",
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "Xref",
+      "code_hash": "44563a7238d879b3629b2f4a70838a34",
+      "outputs": [],
+      "console": []
+    }
+  ]
+}

@@ -39,7 +39,7 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
 
-      - name: Install OSMnx
+      - name: Install ducknx
         run: |
           uv python pin ${{ matrix.python-version }}
           uv sync --all-extras --group docs --group lint --group test
@@ -69,8 +69,8 @@ jobs:
              uv run pytest
              --verbose
              --maxfail=1
-             --typeguard-packages=osmnx
-             --cov=osmnx
+             --typeguard-packages=ducknx
+             --cov=ducknx
              --cov-report=xml
              --numprocesses=3
              --dist=loadgroup

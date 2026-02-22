@@ -18,4 +18,4 @@ uv pip install --no-cache --no-build --system --compile-bytecode --strict -r req
 rm -f requirements-temp.txt
 uv cache clean
 python --version
-ipython -c "import osmnx; print('OSMnx version', osmnx.__version__)"
+ipython -c "import ducknx; print('ducknx version', ducknx.__version__)"

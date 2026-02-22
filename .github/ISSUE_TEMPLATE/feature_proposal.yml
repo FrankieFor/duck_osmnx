@@ -4,7 +4,7 @@ labels: enh
 body:
   - type: markdown
     attributes:
-      value: Thanks for using OSMnx!
+      value: Thanks for using ducknx!
 
   - type: checkboxes
     id: contributing
@@ -55,7 +55,7 @@ body:
     attributes:
       label: What is your proposed solution?
       description: |
-        Describe what you want to change in OSMnx and how you plan to implement it.
+        Describe what you want to change in ducknx and how you plan to implement it.
     validations:
       required: true
 

@@ -16,7 +16,7 @@ twine check --strict ./dist/*
 validate-pyproject ./pyproject.toml
 
 # run the tests and report the test coverage
-pytest --verbose --maxfail=1 --typeguard-packages=osmnx --cov=osmnx --cov-report=term-missing:skip-covered --numprocesses=3 --dist=loadgroup
+pytest --verbose --maxfail=1 --typeguard-packages=ducknx --cov=ducknx --cov-report=term-missing:skip-covered --numprocesses=3 --dist=loadgroup
 
 # build the docs and test that links are alive
 sphinx-build -q -a -E -W --keep-going -b html ./docs/source ./docs/build/html

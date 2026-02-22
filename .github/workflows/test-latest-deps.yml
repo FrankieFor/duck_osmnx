@@ -36,7 +36,7 @@ jobs:
           enable-cache: false
           python-version: ${{ matrix.python-version }}
 
-      - name: Install OSMnx with latest/pre-release dependencies
+      - name: Install ducknx with latest/pre-release dependencies
         run: |
           uv python pin ${{ matrix.python-version }}
           uv sync --no-cache --all-extras --group test --prerelease=allow

@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 echo "Run conda deactivate before running this script."
-ENV=ox
+ENV=dx
 ENV_PATH=$(conda info --base)/envs/$ENV
-PACKAGE=osmnx
+PACKAGE=ducknx
 uv --version
 eval "$(conda shell.bash hook)"
 conda deactivate

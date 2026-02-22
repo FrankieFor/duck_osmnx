@@ -1,4 +1,4 @@
-# OSMnx tests
+# ducknx tests
 
 Read more about the project's standards in the [contributing guidelines](../CONTRIBUTING.md) and ensure that you have installed the necessary dev [dependencies](../pyproject.toml) for the test suite.
 
