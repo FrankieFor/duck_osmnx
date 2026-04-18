@@ -150,6 +150,18 @@ dx.settings.pbf_file_path = "/path/to/your/data.osm.pbf"
 All graph and feature queries read from this local file using DuckDB — no Overpass API calls are made for data retrieval. Nominatim is still used for geocoding place names to coordinates.
 
 
+## ducknx-cleanup — Implemented 2026-04-18
+
+**What was built:** Fixed bugs, hardened SQL construction, standardized on httpx, added DuckDB connection reuse, and vectorized DataFrame processing.
+**Key decisions:**
+- httpx over requests for active code (`_nominatim.py`, `_http.py`); `_overpass.py` keeps `requests` untouched
+- Module-level cached DuckDB connection per PBF path (no thread safety — DuckDB is single-threaded by design)
+- SQL escaping via `_escape_sql()` helper (not parameterization, since DuckDB doesn't support params in `CREATE TEMP TABLE AS`)
+- Vectorized WKB parsing with `shapely.from_wkb()` instead of row-by-row iteration
+**New dependencies:** None (httpx was already a dependency)
+**Spec:** `docs/superpowers/specs/2026-04-17-ducknx-cleanup-design.md`
+**Plan:** `docs/superpowers/plans/2026-04-17-ducknx-cleanup-plan.md`
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
