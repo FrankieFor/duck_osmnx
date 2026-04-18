@@ -19,7 +19,9 @@ import logging as lg
 from typing import Any
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
+import shapely
 from shapely import LineString
 from shapely import MultiPolygon
 from shapely import Polygon
@@ -430,74 +432,97 @@ def _create_gdf_from_dfs(
     gdf
         GeoDataFrame of features with tags and geometry columns.
     """
-    all_features: list[dict[str, Any]] = []
+    frames: list[pd.DataFrame] = []
 
-    # Process nodes
+    # Process nodes — vectorized WKB parsing
     if not nodes_df.empty:
-        for row in nodes_df.itertuples(index=False):
-            feature: dict[str, Any] = {
-                "element": "node",
-                "id": int(row.id),
-                "geometry": wkb.loads(bytes(row.geometry)),
-            }
-            if row.tags:
-                row_tags = dict(row.tags)
-                row_tags.pop("geometry", None)
-                feature.update(row_tags)
-            all_features.append(feature)
+        node_geoms = shapely.from_wkb(nodes_df["geometry"].apply(bytes))
+        node_tags = pd.DataFrame(nodes_df["tags"].apply(dict).tolist())
+        if "geometry" in node_tags.columns:
+            node_tags = node_tags.drop(columns=["geometry"])
+        node_result = pd.DataFrame({
+            "element": "node",
+            "id": nodes_df["id"].astype(int).values,
+        })
+        node_result = pd.concat(
+            [node_result.reset_index(drop=True), node_tags.reset_index(drop=True)],
+            axis=1,
+        )
+        node_result["geometry"] = node_geoms
+        frames.append(node_result)
 
-    # Process ways — geometry already constructed in SQL as linestring or
-    # polygon.  The SQL uses a simplified polygon rule (closed + area!='no').
-    # Apply the full _POLYGON_FEATURES rules as a post-processing refinement.
+    # Process ways — vectorized WKB parsing with polygon refinement
     if not ways_df.empty:
+        way_geoms = shapely.from_wkb(ways_df["geometry"].apply(bytes))
+        way_tags_series = ways_df["tags"].apply(lambda t: dict(t) if t else {})
+        way_tags = pd.DataFrame(way_tags_series.tolist())
+        if "geometry" in way_tags.columns:
+            way_tags = way_tags.drop(columns=["geometry"])
+
         query_tag_keys = set(tags.keys())
-        for row in ways_df.itertuples(index=False):
-            way_tags = dict(row.tags) if row.tags else {}
-            way_tags.pop("geometry", None)
 
-            geom = wkb.loads(bytes(row.geometry))
+        # Vectorized polygon refinement: SQL marked is_polygon based on
+        # simplified rule; use full _POLYGON_FEATURES rules to fix.
+        is_polygon_arr = ways_df["is_polygon"].values
+        should_be_poly = way_tags_series.apply(_should_be_polygon).values
+        needs_fix = is_polygon_arr & ~should_be_poly
+        for idx in np.where(needs_fix)[0]:
+            try:
+                way_geoms[idx] = LineString(way_geoms[idx].exterior.coords)
+            except (AttributeError, GEOSException, ValueError):
+                pass  # keep as-is if conversion fails
 
-            # Refine polygon detection: SQL marked is_polygon based on
-            # simplified rule; use full _POLYGON_FEATURES rules to fix.
-            if row.is_polygon and not _should_be_polygon(way_tags):
-                # SQL made it a polygon but full rules say linestring
-                try:
-                    geom = LineString(geom.exterior.coords)
-                except (AttributeError, GEOSException, ValueError):
-                    pass  # keep as-is if conversion fails
+        way_result = pd.DataFrame({
+            "element": "way",
+            "id": ways_df["id"].astype(int).values,
+        })
+        way_result = pd.concat(
+            [way_result.reset_index(drop=True), way_tags.reset_index(drop=True)],
+            axis=1,
+        )
+        way_result["geometry"] = way_geoms
 
-            # Only include ways whose tags match query tags
-            if (len(query_tag_keys) == 0 and len(way_tags) > 0) or (
-                len(query_tag_keys & way_tags.keys()) > 0
-            ):
-                feature = {
-                    "element": "way",
-                    "id": int(row.id),
-                    "geometry": geom,
-                }
-                feature.update(way_tags)
-                all_features.append(feature)
+        # Filter to ways whose tags match query tags
+        if len(query_tag_keys) > 0:
+            matching_cols = query_tag_keys & set(way_tags.columns)
+            if matching_cols:
+                has_match = way_tags[list(matching_cols)].notna().any(axis=1)
+                way_result = way_result[has_match.values]
+            else:
+                way_result = way_result.iloc[0:0]
+        else:
+            has_tags = way_tags_series.apply(lambda t: len(t) > 0)
+            way_result = way_result[has_tags.values]
 
-    # Process relations — geometry already constructed in SQL
+        frames.append(way_result)
+
+    # Process relations — vectorized WKB parsing
     if not relations_df.empty:
-        for row in relations_df.itertuples(index=False):
-            rel_tags = dict(row.tags) if row.tags else {}
-            rel_tags.pop("geometry", None)
-            feature = {
-                "element": "relation",
-                "id": int(row.id),
-                "geometry": wkb.loads(bytes(row.geometry)),
-            }
-            feature.update(rel_tags)
-            all_features.append(feature)
+        rel_geoms = shapely.from_wkb(relations_df["geometry"].apply(bytes))
+        rel_tags_series = relations_df["tags"].apply(lambda t: dict(t) if t else {})
+        rel_tags = pd.DataFrame(rel_tags_series.tolist())
+        if "geometry" in rel_tags.columns:
+            rel_tags = rel_tags.drop(columns=["geometry"])
 
-    if len(all_features) == 0:
+        rel_result = pd.DataFrame({
+            "element": "relation",
+            "id": relations_df["id"].astype(int).values,
+        })
+        rel_result = pd.concat(
+            [rel_result.reset_index(drop=True), rel_tags.reset_index(drop=True)],
+            axis=1,
+        )
+        rel_result["geometry"] = rel_geoms
+        frames.append(rel_result)
+
+    if len(frames) == 0 or all(len(f) == 0 for f in frames):
         msg = "No matching features. Check query location, tags, and log."
         raise InsufficientResponseError(msg)
 
+    combined = pd.concat(frames, ignore_index=True)
     gdf = (
         gpd.GeoDataFrame(
-            data=all_features,
+            data=combined,
             geometry="geometry",
             crs=settings.default_crs,
         )

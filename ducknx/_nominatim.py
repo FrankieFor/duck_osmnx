@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-import requests
+import httpx
 
 from . import _http
 from . import settings
@@ -108,7 +108,7 @@ def _nominatim_request(
 
     # prepare Nominatim API URL and see if request already exists in cache
     url = settings.nominatim_url.rstrip("/") + "/" + request_type
-    prepared_url = str(requests.Request("GET", url, params=params).prepare().url)
+    prepared_url = str(httpx.Request("GET", url, params=params).url)
     cached_response_json = _http._retrieve_from_cache(prepared_url)
     if isinstance(cached_response_json, list):
         return cached_response_json
@@ -124,7 +124,7 @@ def _nominatim_request(
     # transmit the HTTP GET request
     msg = f"Get {prepared_url} with timeout={settings.requests_timeout}"
     utils.log(msg, level=lg.INFO)
-    response = requests.get(
+    response = httpx.get(
         url,
         params=params,
         timeout=settings.requests_timeout,
@@ -136,7 +136,7 @@ def _nominatim_request(
     if response.status_code in {429, 504}:  # pragma: no cover
         error_pause = 55
         msg = (
-            f"{hostname!r} responded {response.status_code} {response.reason}: "
+            f"{hostname!r} responded {response.status_code} {response.reason_phrase}: "
             f"we'll retry in {error_pause} secs"
         )
         utils.log(msg, level=lg.WARNING)
@@ -147,5 +147,5 @@ def _nominatim_request(
     if not isinstance(response_json, list):
         msg = "Nominatim API did not return a list of results."
         raise InsufficientResponseError(msg)
-    _http._save_to_cache(prepared_url, response_json, response.ok)
+    _http._save_to_cache(prepared_url, response_json, response.is_success)
     return response_json

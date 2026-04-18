@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "duck_osmnx",
+  "project_id": "26a9bcc3-ec9a-4852-9937-be78f6ea30c2"
+}
