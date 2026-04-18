@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import logging as lg
 from hashlib import sha1
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
-from requests.exceptions import JSONDecodeError
+import httpx
 
 from . import settings
 from . import utils
@@ -43,7 +43,7 @@ def _save_to_cache(
     response_json
         The JSON HTTP response.
     ok
-        A `requests.response.ok` value.
+        Whether the HTTP response indicates success (2xx status code).
     """
     if settings.use_cache:
         if not ok:  # pragma: no cover
@@ -140,7 +140,7 @@ def _get_http_headers(
     accept_language: str | None = None,
 ) -> dict[str, str]:
     """
-    Update the default requests HTTP headers with ducknx information.
+    Update the default HTTP headers with ducknx information.
 
     Parameters
     ----------
@@ -164,13 +164,10 @@ def _get_http_headers(
     if accept_language is None:
         accept_language = settings.http_accept_language
 
-    info = {"User-Agent": user_agent, "referer": referer, "Accept-Language": accept_language}
-    headers = dict(requests.utils.default_headers())
-    headers.update(info)
-    return headers
+    return {"User-Agent": user_agent, "referer": referer, "Accept-Language": accept_language}
 
 
-def _hostname_from_url(url: str) -> str:
+def _hostname_from_url(url: str | httpx.URL) -> str:
     """
     Extract the hostname (domain) from a URL.
 
@@ -184,12 +181,12 @@ def _hostname_from_url(url: str) -> str:
     hostname
         The extracted hostname (domain).
     """
-    return urlparse(url).netloc.split(":")[0]
+    return urlparse(str(url)).netloc.split(":")[0]
 
 
-def _parse_response(response: requests.Response) -> dict[str, Any] | list[dict[str, Any]]:
+def _parse_response(response: httpx.Response) -> dict[str, Any] | list[dict[str, Any]]:
     """
-    Parse JSON from a requests response and log the details.
+    Parse JSON from an httpx response and log the details.
 
     Parameters
     ----------
@@ -212,9 +209,9 @@ def _parse_response(response: requests.Response) -> dict[str, Any] | list[dict[s
     try:
         response_json: dict[str, Any] | list[dict[str, Any]] = response.json()
     except JSONDecodeError as e:  # pragma: no cover
-        msg = f"{hostname!r} responded: {response.status_code} {response.reason} {response.text}"
+        msg = f"{hostname!r} responded: {response.status_code} {response.reason_phrase} {response.text}"
         utils.log(msg, level=lg.ERROR)
-        if response.ok:
+        if response.is_success:
             raise InsufficientResponseError(msg) from e
         raise ResponseStatusCodeError(msg) from e
 
@@ -224,7 +221,7 @@ def _parse_response(response: requests.Response) -> dict[str, Any] | list[dict[s
         utils.log(msg, level=lg.WARNING)
 
     # log if the response status_code is not OK
-    if not response.ok:
+    if not response.is_success:
         msg = f"{hostname!r} returned HTTP status code {response.status_code}"
         utils.log(msg, level=lg.WARNING)
 

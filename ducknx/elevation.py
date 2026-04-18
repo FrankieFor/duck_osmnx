@@ -12,7 +12,7 @@ from typing import Any
 import networkx as nx
 import numpy as np
 import pandas as pd
-import requests
+import httpx
 
 from . import _http
 from . import convert
@@ -316,7 +316,7 @@ def _elevation_request(url: str, pause: float) -> dict[str, Any]:
     # transmit the HTTP GET request
     msg = f"Get {url} with timeout={settings.requests_timeout}"
     utils.log(msg, level=lg.INFO)
-    response = requests.get(
+    response = httpx.get(
         url,
         timeout=settings.requests_timeout,
         headers=_http._get_http_headers(),
