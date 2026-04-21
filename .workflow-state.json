@@ -1,0 +1,4 @@
+{
+  "idea": "Make ducknx more efficient and fast, potentially implementing speed and RAM critical parts in Rust instead of Python",
+  "phase": "plan"
+}
