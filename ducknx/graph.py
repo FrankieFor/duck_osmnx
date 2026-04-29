@@ -41,6 +41,7 @@ def graph_from_bbox(
     retain_all: bool = False,
     truncate_by_edge: bool = False,
     custom_filter: str | list[str] | None = None,
+    backend: str = "networkx",
 ) -> nx.MultiDiGraph:
     """
     Download and create a graph within a lat-lon bounding box.
@@ -80,6 +81,8 @@ def graph_from_bbox(
         maximum speed of 50 or two lanes. Also pass in a `network_type` that
         is in `settings.bidirectional_network_types` if you want the graph to
         be fully bidirectional.
+    backend
+        Graph library backend. "networkx" (default) or "rustworkx".
 
     Returns
     -------
@@ -103,6 +106,7 @@ def graph_from_bbox(
         retain_all=retain_all,
         truncate_by_edge=truncate_by_edge,
         custom_filter=custom_filter,
+        backend=backend,
     )
 
     msg = f"graph_from_bbox returned graph with {len(G):,} nodes and {len(G.edges):,} edges"
@@ -120,6 +124,7 @@ def graph_from_point(
     retain_all: bool = False,
     truncate_by_edge: bool = False,
     custom_filter: str | list[str] | None = None,
+    backend: str = "networkx",
 ) -> nx.MultiDiGraph:
     """
     Download and create a graph within some distance of a lat-lon point.
@@ -168,6 +173,8 @@ def graph_from_point(
         maximum speed of 50 or two lanes. Also pass in a `network_type` that
         is in `settings.bidirectional_network_types` if you want the graph to
         be fully bidirectional.
+    backend
+        Graph library backend. "networkx" (default) or "rustworkx".
 
     Returns
     -------
@@ -195,6 +202,7 @@ def graph_from_point(
         retain_all=retain_all,
         truncate_by_edge=truncate_by_edge,
         custom_filter=custom_filter,
+        backend=backend,
     )
 
     if dist_type == "network":
@@ -217,6 +225,7 @@ def graph_from_address(
     retain_all: bool = False,
     truncate_by_edge: bool = False,
     custom_filter: str | list[str] | None = None,
+    backend: str = "networkx",
 ) -> nx.MultiDiGraph:
     """
     Download and create a graph within some distance of an address.
@@ -264,6 +273,8 @@ def graph_from_address(
         maximum speed of 50 or two lanes. Also pass in a `network_type` that
         is in `settings.bidirectional_network_types` if you want the graph to
         be fully bidirectional.
+    backend
+        Graph library backend. "networkx" (default) or "rustworkx".
 
     Returns
     -------
@@ -289,6 +300,7 @@ def graph_from_address(
         retain_all=retain_all,
         truncate_by_edge=truncate_by_edge,
         custom_filter=custom_filter,
+        backend=backend,
     )
 
     msg = f"graph_from_address returned graph with {len(G):,} nodes and {len(G.edges):,} edges"
@@ -305,6 +317,7 @@ def graph_from_place(
     truncate_by_edge: bool = False,
     which_result: int | None | list[int | None] = None,
     custom_filter: str | list[str] | None = None,
+    backend: str = "networkx",
 ) -> nx.MultiDiGraph:
     """
     Download and create a graph within the boundaries of some place(s).
@@ -359,6 +372,8 @@ def graph_from_place(
         maximum speed of 50 or two lanes. Also pass in a `network_type` that
         is in `settings.bidirectional_network_types` if you want the graph to
         be fully bidirectional.
+    backend
+        Graph library backend. "networkx" (default) or "rustworkx".
 
     Returns
     -------
@@ -384,6 +399,7 @@ def graph_from_place(
         retain_all=retain_all,
         truncate_by_edge=truncate_by_edge,
         custom_filter=custom_filter,
+        backend=backend,
     )
 
     msg = f"graph_from_place returned graph with {len(G):,} nodes and {len(G.edges):,} edges"
@@ -399,6 +415,7 @@ def graph_from_polygon(
     retain_all: bool = False,
     truncate_by_edge: bool = False,
     custom_filter: str | list[str] | None = None,
+    backend: str = "networkx",
 ) -> nx.MultiDiGraph:
     """
     Download and create a graph within the boundaries of a (Multi)Polygon.
@@ -438,6 +455,8 @@ def graph_from_polygon(
         maximum speed of 50 or two lanes. Also pass in a `network_type` that
         is in `settings.bidirectional_network_types` if you want the graph to
         be fully bidirectional.
+    backend
+        Graph library backend. "networkx" (default) or "rustworkx".
 
     Returns
     -------
@@ -476,9 +495,12 @@ def graph_from_polygon(
     bidirectional = network_type in settings.bidirectional_network_types
 
     nodes_df, ways_df = _pbf_reader._read_pbf_network_duckdb(
-        poly_buff, network_type, custom_filter, settings.pbf_file_path
+        poly_buff,
+        network_type,
+        custom_filter,
+        settings.pbf_file_path,
     )
-    G_buff = _create_graph_from_dfs(nodes_df, ways_df, bidirectional)
+    G_buff = _create_graph_from_dfs(nodes_df, ways_df, bidirectional, backend=backend)
 
     # truncate buffered graph to the buffered polygon and retain_all for
     # now. needed because the query returns entire ways that also include
@@ -591,13 +613,14 @@ def _create_graph_from_dfs(
     nodes_df: pd.DataFrame | pa.Table,
     ways_df: pd.DataFrame | pa.Table,
     bidirectional: bool,  # noqa: FBT001
+    backend: str = "networkx",
 ) -> nx.MultiDiGraph:
     """
-    Create a NetworkX MultiDiGraph from node and way DataFrames.
+    Create a graph from node and way DataFrames.
 
-    Create a NetworkX MultiDiGraph from node and way DataFrames or Arrow
-    tables returned by DuckDB. Uses bulk edge list construction for
-    performance instead of per-row iteration.
+    Create a NetworkX MultiDiGraph (or rustworkx PyDiGraph if
+    backend="rustworkx") from node and way DataFrames or Arrow tables
+    returned by DuckDB. Uses bulk edge list construction for performance.
 
     Parameters
     ----------
@@ -609,12 +632,23 @@ def _create_graph_from_dfs(
         columns.
     bidirectional
         If True, create bidirectional edges for one-way streets.
+    backend
+        Graph library backend. "networkx" (default) returns a
+        ``nx.MultiDiGraph``. "rustworkx" returns a ``rx.PyDiGraph``
+        and requires the ``rustworkx`` package (install via
+        ``pip install ducknx[fast]``).
 
     Returns
     -------
     G
-        The resulting MultiDiGraph.
+        The resulting graph (MultiDiGraph or PyDiGraph).
     """
+    if backend == "rustworkx":
+        return _create_graph_rustworkx(nodes_df, ways_df, bidirectional)
+    if backend != "networkx":
+        msg = f"Unknown backend: {backend!r}. Use 'networkx' or 'rustworkx'."
+        raise ValueError(msg)
+
     # Convert Arrow tables to pandas if needed
     if isinstance(nodes_df, pa.Table):
         nodes_df = nodes_df.to_pandas()
@@ -670,6 +704,157 @@ def _create_graph_from_dfs(
         G = distance.add_edge_lengths(G)
 
     return G
+
+
+def _build_rx_edges(
+    ways_df: pd.DataFrame,
+    osm_to_rx: dict[int, int],
+    bidirectional: bool,  # noqa: FBT001
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """
+    Build edge tuples for a rustworkx graph from a ways DataFrame.
+
+    Parameters
+    ----------
+    ways_df
+        DataFrame with columns: osmid, refs, plus useful tag columns.
+    osm_to_rx
+        Mapping from OSM node IDs to rustworkx node indices.
+    bidirectional
+        If True, create bidirectional edges for one-way streets.
+
+    Returns
+    -------
+    edge_list
+        List of ``(source_rx_idx, target_rx_idx, attrs_dict)`` tuples.
+    """
+    oneway_values = {"yes", "true", "1", "-1", "reverse", "T", "F"}
+    reversed_values = {"-1", "reverse", "T"}
+    tag_cols = [c for c in ways_df.columns if c not in ("osmid", "refs")]
+
+    edge_list: list[tuple[int, int, dict[str, Any]]] = []
+
+    for row in ways_df.itertuples(index=False):
+        attrs: dict[str, Any] = {"osmid": row.osmid}
+        for col in tag_cols:
+            val = getattr(row, col)
+            if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                attrs[col] = val
+
+        # Deduplicate consecutive nodes
+        nodes = [g for g, _ in groupby(row.refs)]
+
+        is_one_way = _is_path_one_way(attrs, bidirectional, oneway_values)
+        if is_one_way and _is_path_reversed(attrs, reversed_values):
+            nodes.reverse()
+
+        if not settings.all_oneway:
+            attrs["oneway"] = is_one_way
+
+        # Forward edges
+        attrs["reversed"] = False
+        for j in range(len(nodes) - 1):
+            u_osm, v_osm = nodes[j], nodes[j + 1]
+            if u_osm in osm_to_rx and v_osm in osm_to_rx:
+                edge_list.append((osm_to_rx[u_osm], osm_to_rx[v_osm], attrs.copy()))
+
+        # Reverse edges for bidirectional
+        if not is_one_way:
+            attrs_rev = {**attrs, "reversed": True}
+            for j in range(len(nodes) - 1):
+                u_osm, v_osm = nodes[j], nodes[j + 1]
+                if u_osm in osm_to_rx and v_osm in osm_to_rx:
+                    edge_list.append(
+                        (osm_to_rx[v_osm], osm_to_rx[u_osm], attrs_rev.copy()),
+                    )
+
+    return edge_list
+
+
+def _create_graph_rustworkx(
+    nodes_df: pd.DataFrame,
+    ways_df: pd.DataFrame,
+    bidirectional: bool,  # noqa: FBT001
+) -> Any:  # noqa: ANN401
+    """
+    Create a rustworkx PyDiGraph from node and way DataFrames.
+
+    Parameters
+    ----------
+    nodes_df
+        DataFrame with columns: id, y, x, plus useful tag columns.
+    ways_df
+        DataFrame with columns: osmid, refs, plus useful tag columns.
+    bidirectional
+        If True, create bidirectional edges for one-way streets.
+
+    Returns
+    -------
+    G
+        A rustworkx PyDiGraph with node/edge payloads as dicts.
+    """
+    try:
+        import rustworkx as rx  # noqa: PLC0415
+    except ImportError:
+        msg = (
+            "rustworkx is required for backend='rustworkx'. Install with: pip install ducknx[fast]"
+        )
+        raise ImportError(msg) from None
+
+    G = rx.PyDiGraph(
+        attrs={
+            "created_date": utils.ts(),
+            "created_with": f"ducknx {metadata_version('ducknx')}",
+            "crs": settings.default_crs,
+        }
+    )
+
+    # Add nodes -- build payload dicts and track OSM ID -> rx index mapping
+    nodes_df = nodes_df.set_index("id")
+    nodes_df = nodes_df.dropna(axis="columns", how="all")
+    node_payloads = _build_node_payloads(nodes_df)
+
+    rx_indices = G.add_nodes_from(node_payloads)
+    osm_to_rx = {int(osm_id): rx_indices[i] for i, osm_id in enumerate(nodes_df.index)}
+
+    # Store reverse mapping as graph attribute
+    node_id_map = {rx_indices[i]: int(osm_id) for i, osm_id in enumerate(nodes_df.index)}
+    G.attrs["node_id_map"] = node_id_map
+
+    # Add edges in bulk
+    edge_list = _build_rx_edges(ways_df, osm_to_rx, bidirectional)
+    G.add_edges_from(edge_list)
+
+    msg = f"Created rustworkx graph with {G.num_nodes():,} nodes and {G.num_edges():,} edges"
+    utils.log(msg, level=lg.INFO)
+
+    return G
+
+
+def _build_node_payloads(nodes_df: pd.DataFrame) -> list[dict[str, Any]]:
+    """
+    Build node payload dicts from a nodes DataFrame indexed by OSM ID.
+
+    Parameters
+    ----------
+    nodes_df
+        DataFrame indexed by OSM node ID with columns like y, x, and tags.
+
+    Returns
+    -------
+    payloads
+        List of node attribute dicts, each containing ``osmid``.
+    """
+    node_cols = list(nodes_df.columns)
+    payloads = []
+    for osm_id, row in nodes_df.iterrows():
+        payload: dict[str, Any] = {"osmid": int(osm_id)}
+        for col in node_cols:
+            val = row[col]
+            if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                payload[col] = val
+        payloads.append(payload)
+    return payloads
 
 
 def _is_path_one_way(attrs: dict[str, Any], bidirectional: bool, oneway_values: set[str]) -> bool:  # noqa: FBT001

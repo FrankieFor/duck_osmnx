@@ -561,3 +561,37 @@ def _update_edge_keys(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
         G.remove_edge(u, v, key=k)
 
     return G
+
+
+def rustworkx_to_networkx(G_rx: Any) -> nx.MultiDiGraph:  # noqa: ANN401
+    """
+    Convert a rustworkx PyDiGraph to a NetworkX MultiDiGraph.
+
+    Parameters
+    ----------
+    G_rx
+        A rustworkx PyDiGraph with node/edge payloads as dicts.
+
+    Returns
+    -------
+    G
+        The equivalent NetworkX MultiDiGraph.
+    """
+    G = nx.MultiDiGraph(**G_rx.attrs)
+    node_id_map = G_rx.attrs.get("node_id_map", {})
+
+    # Add nodes using OSM IDs
+    for rx_idx in G_rx.node_indices():
+        data = G_rx.get_node_data(rx_idx)
+        osm_id = node_id_map.get(rx_idx, rx_idx)
+        G.add_node(osm_id, **data)
+
+    # Add edges using OSM IDs
+    for edge_idx in G_rx.edge_indices():
+        src, tgt = G_rx.get_edge_endpoints_by_index(edge_idx)
+        data = G_rx.get_edge_data_by_index(edge_idx)
+        u = node_id_map.get(src, src)
+        v = node_id_map.get(tgt, tgt)
+        G.add_edge(u, v, **data)
+
+    return G
