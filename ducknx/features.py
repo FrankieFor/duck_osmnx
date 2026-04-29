@@ -21,6 +21,7 @@ from typing import Any
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import shapely
 from shapely import LineString
 from shapely import MultiPolygon
@@ -402,9 +403,9 @@ def _should_be_polygon(way_tags: dict[str, Any]) -> bool:
 
 
 def _create_gdf_from_dfs(
-    nodes_df: pd.DataFrame,
-    ways_df: pd.DataFrame,
-    relations_df: pd.DataFrame,
+    nodes_df: pd.DataFrame | pa.Table,
+    ways_df: pd.DataFrame | pa.Table,
+    relations_df: pd.DataFrame | pa.Table,
     polygon: Polygon | MultiPolygon,
     tags: dict[str, bool | str | list[str]],
 ) -> gpd.GeoDataFrame:
@@ -412,16 +413,17 @@ def _create_gdf_from_dfs(
     Create a GeoDataFrame of features from node, way, and relation DataFrames.
 
     Create a GeoDataFrame of features from node, way, and relation
-    DataFrames returned by DuckDB.
+    DataFrames or Arrow tables returned by DuckDB.
 
     Parameters
     ----------
     nodes_df
-        DataFrame with columns: id, tags, geometry (WKB).
+        DataFrame or Arrow table with columns: id, tags, geometry (WKB).
     ways_df
-        DataFrame with columns: id, tags, refs, geometry (WKB), is_polygon.
+        DataFrame or Arrow table with columns: id, tags, refs, geometry
+        (WKB), is_polygon.
     relations_df
-        DataFrame with columns: id, tags, geometry (WKB).
+        DataFrame or Arrow table with columns: id, tags, geometry (WKB).
     polygon
         Spatial boundaries to filter the final GeoDataFrame.
     tags
@@ -432,6 +434,14 @@ def _create_gdf_from_dfs(
     gdf
         GeoDataFrame of features with tags and geometry columns.
     """
+    # Convert Arrow tables to pandas if needed
+    if isinstance(nodes_df, pa.Table):
+        nodes_df = nodes_df.to_pandas()
+    if isinstance(ways_df, pa.Table):
+        ways_df = ways_df.to_pandas()
+    if isinstance(relations_df, pa.Table):
+        relations_df = relations_df.to_pandas()
+
     frames: list[pd.DataFrame] = []
 
     # Process nodes — vectorized WKB parsing

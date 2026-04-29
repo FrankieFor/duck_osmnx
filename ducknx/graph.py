@@ -14,6 +14,7 @@ from typing import Any
 
 import networkx as nx
 import pandas as pd
+import pyarrow as pa
 from shapely import MultiPolygon
 from shapely import Polygon
 
@@ -514,22 +515,24 @@ def graph_from_polygon(
 
 
 def _create_graph_from_dfs(
-    nodes_df: pd.DataFrame,
-    ways_df: pd.DataFrame,
+    nodes_df: pd.DataFrame | pa.Table,
+    ways_df: pd.DataFrame | pa.Table,
     bidirectional: bool,  # noqa: FBT001
 ) -> nx.MultiDiGraph:
     """
     Create a NetworkX MultiDiGraph from node and way DataFrames.
 
-    Create a NetworkX MultiDiGraph from node and way DataFrames returned
-    by DuckDB.
+    Create a NetworkX MultiDiGraph from node and way DataFrames or Arrow
+    tables returned by DuckDB.
 
     Parameters
     ----------
     nodes_df
-        DataFrame with columns: id, y, x, plus useful tag columns.
+        DataFrame or Arrow table with columns: id, y, x, plus useful tag
+        columns.
     ways_df
-        DataFrame with columns: osmid, refs, plus useful tag columns.
+        DataFrame or Arrow table with columns: osmid, refs, plus useful tag
+        columns.
     bidirectional
         If True, create bidirectional edges for one-way streets.
 
@@ -538,6 +541,12 @@ def _create_graph_from_dfs(
     G
         The resulting MultiDiGraph.
     """
+    # Convert Arrow tables to pandas if needed
+    if isinstance(nodes_df, pa.Table):
+        nodes_df = nodes_df.to_pandas()
+    if isinstance(ways_df, pa.Table):
+        ways_df = ways_df.to_pandas()
+
     # create the MultiDiGraph and set its graph-level attributes
     metadata = {
         "created_date": utils.ts(),

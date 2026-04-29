@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging as lg
 from pathlib import Path
 
-import pandas as pd
+import pyarrow as pa
 from shapely import MultiPolygon
 from shapely import Polygon
 
@@ -135,12 +135,12 @@ def _read_pbf_network_duckdb(
     network_type: str,
     custom_filter: str | list[str] | None,
     pbf_path: str | Path,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pa.Table, pa.Table]:
     """
     Retrieve networked ways and nodes from a local PBF file using DuckDB SQL.
 
     This optimized code path performs filtering and joins in DuckDB and returns
-    pandas DataFrames directly, avoiding intermediate JSON dict conversion.
+    Arrow tables directly, avoiding intermediate JSON dict conversion.
 
     Parameters
     ----------
@@ -156,7 +156,7 @@ def _read_pbf_network_duckdb(
     Returns
     -------
     nodes_df, ways_df
-        DataFrames of nodes and ways.
+        Arrow tables of nodes and ways.
 
     Raises
     ------
@@ -209,9 +209,9 @@ def _read_pbf_network_duckdb(
             refs,
             {way_tag_cols}
         FROM filtered_ways
-    """).fetchdf()
+    """).to_arrow_table()
 
-    if ways_df.empty:
+    if len(ways_df) == 0:
         msg = f"No ways found matching network filter in {pbf_path}"
         raise InsufficientResponseError(msg)
 
@@ -232,9 +232,9 @@ def _read_pbf_network_duckdb(
             SELECT DISTINCT UNNEST(refs) AS node_id FROM filtered_ways
         ) r ON n.id = r.node_id
         WHERE n.kind = 'node'
-    """).fetchdf()
+    """).to_arrow_table()
 
-    if nodes_df.empty:
+    if len(nodes_df) == 0:
         msg = "No nodes found for the filtered ways"
         raise InsufficientResponseError(msg)
 
@@ -247,12 +247,12 @@ def _read_pbf_features_duckdb(
     polygon: Polygon | MultiPolygon,
     tags: dict[str, bool | str | list[str]],
     pbf_path: str | Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pa.Table, pa.Table, pa.Table]:
     """
     Retrieve OSM features from a local PBF file using DuckDB SQL.
 
     This optimized code path performs filtering and geometry construction in
-    DuckDB and returns pandas DataFrames directly.
+    DuckDB and returns Arrow tables directly.
 
     Parameters
     ----------
@@ -266,7 +266,7 @@ def _read_pbf_features_duckdb(
     Returns
     -------
     nodes_df, ways_df, relations_df
-        DataFrames of nodes, ways, and relations.
+        Arrow tables of nodes, ways, and relations.
 
     Raises
     ------
@@ -299,7 +299,7 @@ def _read_pbf_features_duckdb(
         WHERE kind = 'node'
         AND ({tag_filter})
         AND ST_Within(ST_Point(lon, lat), ST_GeomFromText('{polygon_wkt}'))
-    """).fetchdf()
+    """).to_arrow_table()
 
     utils.log(f"Found {len(nodes_df)} feature nodes", level=lg.INFO)
 
@@ -390,7 +390,7 @@ def _read_pbf_features_duckdb(
             wpf.is_polygon
         FROM matching_ways_linestrings mwl
         JOIN way_polygon_feature wpf ON mwl.id = wpf.id
-    """).fetchdf()
+    """).to_arrow_table()
 
     utils.log(f"Found {len(ways_df)} feature ways", level=lg.INFO)
 
@@ -556,11 +556,11 @@ def _read_pbf_features_duckdb(
         ) g
         JOIN matching_relations r ON r.id = g.id
         GROUP BY r.id, r.tags
-    """).fetchdf()
+    """).to_arrow_table()
 
     utils.log(f"Found {len(relations_df)} feature relations", level=lg.INFO)
 
-    if nodes_df.empty and ways_df.empty and relations_df.empty:
+    if len(nodes_df) == 0 and len(ways_df) == 0 and len(relations_df) == 0:
         msg = f"No feature data found in {pbf_path} for the specified area and tags"
         raise InsufficientResponseError(msg)
 
