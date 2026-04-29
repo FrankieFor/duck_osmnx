@@ -742,7 +742,11 @@ def _build_rx_edges(
                 attrs[col] = val
 
         # Deduplicate consecutive nodes
-        nodes = [g for g, _ in groupby(row.refs)]
+        raw_refs = row.refs
+        nodes = [raw_refs[0]]
+        for j in range(1, len(raw_refs)):
+            if raw_refs[j] != raw_refs[j - 1]:
+                nodes.append(raw_refs[j])
 
         is_one_way = _is_path_one_way(attrs, bidirectional, oneway_values)
         if is_one_way and _is_path_reversed(attrs, reversed_values):
@@ -808,6 +812,12 @@ def _create_graph_rustworkx(
             "crs": settings.default_crs,
         }
     )
+
+    # Convert Arrow tables to pandas if needed
+    if isinstance(nodes_df, pa.Table):
+        nodes_df = nodes_df.to_pandas()
+    if isinstance(ways_df, pa.Table):
+        ways_df = ways_df.to_pandas()
 
     # Add nodes -- build payload dicts and track OSM ID -> rx index mapping
     nodes_df = nodes_df.set_index("id")

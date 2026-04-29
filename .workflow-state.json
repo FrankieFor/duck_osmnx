@@ -7,6 +7,6 @@
   "epic_id": "duck_osmnx-sbt",
   "workflow_branch": "workflow/ducknx-performance",
   "task_ids": ["duck_osmnx-sbt.1", "duck_osmnx-sbt.2", "duck_osmnx-sbt.3", "duck_osmnx-sbt.4", "duck_osmnx-sbt.5", "duck_osmnx-sbt.6", "duck_osmnx-sbt.7"],
-  "dispatched": ["duck_osmnx-sbt.1", "duck_osmnx-sbt.2", "duck_osmnx-sbt.3", "duck_osmnx-sbt.4"],
-  "merged": ["duck_osmnx-sbt.1", "duck_osmnx-sbt.2", "duck_osmnx-sbt.3"]
+  "dispatched": ["duck_osmnx-sbt.1", "duck_osmnx-sbt.2", "duck_osmnx-sbt.3", "duck_osmnx-sbt.4", "duck_osmnx-sbt.5", "duck_osmnx-sbt.6"],
+  "merged": ["duck_osmnx-sbt.1", "duck_osmnx-sbt.2", "duck_osmnx-sbt.3", "duck_osmnx-sbt.4", "duck_osmnx-sbt.5", "duck_osmnx-sbt.6"]
 }

@@ -258,7 +258,7 @@ def _read_pbf_network_duckdb(
             refs,
             {way_tag_cols}
         FROM filtered_ways
-    """).to_arrow_table()
+    """).fetch_arrow_table()
 
     if len(ways_df) == 0:
         msg = f"No ways found matching network filter in {pbf_path}"
@@ -281,7 +281,7 @@ def _read_pbf_network_duckdb(
             SELECT DISTINCT UNNEST(refs) AS node_id FROM filtered_ways
         ) r ON n.id = r.node_id
         WHERE n.kind = 'node'
-    """).to_arrow_table()
+    """).fetch_arrow_table()
 
     if len(nodes_df) == 0:
         msg = "No nodes found for the filtered ways"
@@ -348,7 +348,7 @@ def _read_pbf_features_duckdb(
         WHERE kind = 'node'
         AND ({tag_filter})
         AND ST_Within(ST_Point(lon, lat), ST_GeomFromText('{polygon_wkt}'))
-    """).to_arrow_table()
+    """).fetch_arrow_table()
 
     utils.log(f"Found {len(nodes_df)} feature nodes", level=lg.INFO)
 
@@ -437,7 +437,7 @@ def _read_pbf_features_duckdb(
             wpf.is_polygon
         FROM matching_ways_linestrings mwl
         JOIN way_polygon_feature wpf ON mwl.id = wpf.id
-    """).to_arrow_table()
+    """).fetch_arrow_table()
 
     utils.log(f"Found {len(ways_df)} feature ways", level=lg.INFO)
 
@@ -603,7 +603,7 @@ def _read_pbf_features_duckdb(
         ) g
         JOIN matching_relations r ON r.id = g.id
         GROUP BY r.id, r.tags
-    """).to_arrow_table()
+    """).fetch_arrow_table()
 
     utils.log(f"Found {len(relations_df)} feature relations", level=lg.INFO)
 
