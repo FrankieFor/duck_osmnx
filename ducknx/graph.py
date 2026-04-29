@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging as lg
 from collections.abc import Iterable
 from importlib.metadata import version as metadata_version
-from itertools import groupby
+from typing import TYPE_CHECKING
 from typing import Any
 
 import networkx as nx
@@ -17,6 +17,9 @@ import pandas as pd
 import pyarrow as pa
 from shapely import MultiPolygon
 from shapely import Polygon
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from . import _pbf_reader
 from . import distance
@@ -514,6 +517,76 @@ def graph_from_polygon(
     return G
 
 
+def _build_way_edges(
+    i: int,
+    osmid_arr: np.ndarray,  # type: ignore[type-arg]
+    refs_arr: np.ndarray,  # type: ignore[type-arg]
+    tag_arrays: dict[str, np.ndarray],  # type: ignore[type-arg]
+    tag_cols: list[str],
+    bidirectional: bool,  # noqa: FBT001
+    oneway_values: set[str],
+    reversed_values: set[str],
+) -> tuple[list[tuple[int, int, dict[str, Any]]], list[tuple[int, int, dict[str, Any]]]]:
+    """
+    Build forward and reverse edge tuples for a single way.
+
+    Parameters
+    ----------
+    i
+        Row index in the way arrays.
+    osmid_arr
+        Array of OSM way IDs.
+    refs_arr
+        Array of node reference lists.
+    tag_arrays
+        Dict mapping tag column names to arrays of values.
+    tag_cols
+        List of tag column names.
+    bidirectional
+        If True, create bidirectional edges for one-way streets.
+    oneway_values
+        Set of values OSM uses for "oneway" tag.
+    reversed_values
+        Set of values OSM uses for reversed direction.
+
+    Returns
+    -------
+    forward_edges, reverse_edges
+        Lists of (u, v, attrs) tuples for forward and reverse directions.
+    """
+    # build attribute dict from non-null tag values
+    attrs: dict[str, Any] = {"osmid": osmid_arr[i]}
+    for col in tag_cols:
+        val = tag_arrays[col][i]
+        if val is not None and not (isinstance(val, float) and pd.isna(val)):
+            attrs[col] = val
+
+    # deduplicate consecutive nodes
+    raw_refs = refs_arr[i]
+    nodes = [raw_refs[0]]
+    nodes.extend(raw_refs[j] for j in range(1, len(raw_refs)) if raw_refs[j] != raw_refs[j - 1])
+
+    # determine one-way and reversed status
+    is_one_way = _is_path_one_way(attrs, bidirectional, oneway_values)
+    if is_one_way and _is_path_reversed(attrs, reversed_values):
+        nodes.reverse()
+
+    if not settings.all_oneway:
+        attrs["oneway"] = is_one_way
+
+    # build forward edge pairs
+    attrs["reversed"] = False
+    forward = [(nodes[j], nodes[j + 1], attrs.copy()) for j in range(len(nodes) - 1)]
+
+    # build reverse edges for non-one-way paths
+    reverse: list[tuple[int, int, dict[str, Any]]] = []
+    if not is_one_way:
+        attrs_rev = {**attrs, "reversed": True}
+        reverse = [(nodes[j + 1], nodes[j], attrs_rev.copy()) for j in range(len(nodes) - 1)]
+
+    return forward, reverse
+
+
 def _create_graph_from_dfs(
     nodes_df: pd.DataFrame | pa.Table,
     ways_df: pd.DataFrame | pa.Table,
@@ -523,7 +596,8 @@ def _create_graph_from_dfs(
     Create a NetworkX MultiDiGraph from node and way DataFrames.
 
     Create a NetworkX MultiDiGraph from node and way DataFrames or Arrow
-    tables returned by DuckDB.
+    tables returned by DuckDB. Uses bulk edge list construction for
+    performance instead of per-row iteration.
 
     Parameters
     ----------
@@ -555,31 +629,38 @@ def _create_graph_from_dfs(
     }
     G = nx.MultiDiGraph(**metadata)
 
-    # add nodes from DataFrame
+    # add nodes from DataFrame — bulk insert via dict
     nodes_df = nodes_df.set_index("id")
     nodes_df = nodes_df.dropna(axis="columns", how="all")
     G.add_nodes_from(nodes_df.to_dict("index").items())
 
-    # build path dicts from ways DataFrame
-    paths = []
-    # get non-osmid/refs columns that may have tag values
+    # build edge tuples in bulk instead of per-row iteration
     tag_cols = [c for c in ways_df.columns if c not in ("osmid", "refs")]
-    for row in ways_df.itertuples(index=False):
-        path: dict[str, Any] = {"osmid": row.osmid}
-        # deduplicate consecutive nodes
-        path["nodes"] = [g for g, _ in groupby(row.refs)]
-        # add non-null tag columns
-        for col in tag_cols:
-            val = getattr(row, col)
-            if val is not None and not (isinstance(val, float) and pd.isna(val)):
-                path[col] = val
-        paths.append(path)
+    oneway_values = {"yes", "true", "1", "-1", "reverse", "T", "F"}
+    reversed_values = {"-1", "reverse", "T"}
 
-    msg = f"Creating graph from {len(nodes_df):,} OSM nodes and {len(paths):,} OSM ways..."
+    all_edges_forward: list[tuple[int, int, dict[str, Any]]] = []
+    all_edges_reverse: list[tuple[int, int, dict[str, Any]]] = []
+
+    # extract columns as numpy arrays for fast access
+    osmid_arr = ways_df["osmid"].to_numpy()
+    refs_arr = ways_df["refs"].to_numpy()
+    tag_arrays = {col: ways_df[col].to_numpy() for col in tag_cols}
+
+    msg = f"Creating graph from {len(nodes_df):,} OSM nodes and {len(ways_df):,} OSM ways..."
     utils.log(msg, level=lg.INFO)
 
-    # add paths as edges using existing function
-    _add_paths(G, paths, bidirectional)
+    for i in range(len(ways_df)):
+        fwd, rev = _build_way_edges(
+            i, osmid_arr, refs_arr, tag_arrays, tag_cols,
+            bidirectional, oneway_values, reversed_values,
+        )
+        all_edges_forward.extend(fwd)
+        all_edges_reverse.extend(rev)
+
+    # single bulk insert for all edges
+    G.add_edges_from(all_edges_forward)
+    G.add_edges_from(all_edges_reverse)
 
     msg = f"Created graph with {len(G):,} nodes and {len(G.edges):,} edges"
     utils.log(msg, level=lg.INFO)
