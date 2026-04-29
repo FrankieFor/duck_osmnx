@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging as lg
 from pathlib import Path
 
-import pandas as pd
+import pyarrow as pa
 from shapely import MultiPolygon
 from shapely import Polygon
 
@@ -130,17 +130,66 @@ def _build_tag_filter(tags: dict[str, bool | str | list[str]]) -> str:
     return " OR ".join(tag_conditions) if tag_conditions else "1=1"
 
 
+def _build_polygon_case_sql() -> str:
+    """
+    Build a SQL CASE expression implementing OSM polygon classification rules.
+
+    Translates the _POLYGON_FEATURES dict from features.py into a SQL CASE
+    expression that determines whether a closed way should be a Polygon.
+
+    Returns
+    -------
+    case_sql
+        SQL CASE expression returning TRUE/FALSE.
+    """
+    # Import inside function to avoid circular imports
+    from .features import _POLYGON_FEATURES  # noqa: PLC0415
+
+    conditions = []
+    # area=no always means not a polygon
+    conditions.append("WHEN tags['area'] = 'no' THEN FALSE")
+
+    for tag, rule_dict in _POLYGON_FEATURES.items():
+        escaped_tag = _duckdb._escape_sql(tag)
+        rule = rule_dict["polygon"]
+        if rule == "all":
+            conditions.append(f"WHEN tags['{escaped_tag}'] IS NOT NULL THEN TRUE")
+        elif rule == "passlist":
+            values = rule_dict.get("values", set())
+            if values:
+                escaped_vals = "', '".join(_duckdb._escape_sql(v) for v in sorted(values))
+                conditions.append(
+                    f"WHEN tags['{escaped_tag}'] IN ('{escaped_vals}') THEN TRUE",
+                )
+        elif rule == "blocklist":
+            values = rule_dict.get("values", set())
+            if values:
+                escaped_vals = "', '".join(_duckdb._escape_sql(v) for v in sorted(values))
+                conditions.append(
+                    f"WHEN tags['{escaped_tag}'] IS NOT NULL "
+                    f"AND tags['{escaped_tag}'] NOT IN ('{escaped_vals}') THEN TRUE",
+                )
+            else:
+                conditions.append(f"WHEN tags['{escaped_tag}'] IS NOT NULL THEN TRUE")
+
+    case_lines = "\n            ".join(conditions)
+    return f"""CASE
+            {case_lines}
+            ELSE FALSE
+        END"""
+
+
 def _read_pbf_network_duckdb(
     polygon: Polygon | MultiPolygon,
     network_type: str,
     custom_filter: str | list[str] | None,
     pbf_path: str | Path,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pa.Table, pa.Table]:
     """
     Retrieve networked ways and nodes from a local PBF file using DuckDB SQL.
 
     This optimized code path performs filtering and joins in DuckDB and returns
-    pandas DataFrames directly, avoiding intermediate JSON dict conversion.
+    Arrow tables directly, avoiding intermediate JSON dict conversion.
 
     Parameters
     ----------
@@ -156,7 +205,7 @@ def _read_pbf_network_duckdb(
     Returns
     -------
     nodes_df, ways_df
-        DataFrames of nodes and ways.
+        Arrow tables of nodes and ways.
 
     Raises
     ------
@@ -209,9 +258,9 @@ def _read_pbf_network_duckdb(
             refs,
             {way_tag_cols}
         FROM filtered_ways
-    """).fetchdf()
+    """).fetch_arrow_table()
 
-    if ways_df.empty:
+    if len(ways_df) == 0:
         msg = f"No ways found matching network filter in {pbf_path}"
         raise InsufficientResponseError(msg)
 
@@ -232,9 +281,9 @@ def _read_pbf_network_duckdb(
             SELECT DISTINCT UNNEST(refs) AS node_id FROM filtered_ways
         ) r ON n.id = r.node_id
         WHERE n.kind = 'node'
-    """).fetchdf()
+    """).fetch_arrow_table()
 
-    if nodes_df.empty:
+    if len(nodes_df) == 0:
         msg = "No nodes found for the filtered ways"
         raise InsufficientResponseError(msg)
 
@@ -247,12 +296,12 @@ def _read_pbf_features_duckdb(
     polygon: Polygon | MultiPolygon,
     tags: dict[str, bool | str | list[str]],
     pbf_path: str | Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pa.Table, pa.Table, pa.Table]:
     """
     Retrieve OSM features from a local PBF file using DuckDB SQL.
 
     This optimized code path performs filtering and geometry construction in
-    DuckDB and returns pandas DataFrames directly.
+    DuckDB and returns Arrow tables directly.
 
     Parameters
     ----------
@@ -266,7 +315,7 @@ def _read_pbf_features_duckdb(
     Returns
     -------
     nodes_df, ways_df, relations_df
-        DataFrames of nodes, ways, and relations.
+        Arrow tables of nodes, ways, and relations.
 
     Raises
     ------
@@ -299,7 +348,7 @@ def _read_pbf_features_duckdb(
         WHERE kind = 'node'
         AND ({tag_filter})
         AND ST_Within(ST_Point(lon, lat), ST_GeomFromText('{polygon_wkt}'))
-    """).fetchdf()
+    """).fetch_arrow_table()
 
     utils.log(f"Found {len(nodes_df)} feature nodes", level=lg.INFO)
 
@@ -364,16 +413,14 @@ def _read_pbf_features_duckdb(
         GROUP BY tagged_ways.id, tagged_ways.tags, tagged_ways.refs
     """)
 
-    # Step 5: Determine polygon vs linestring and output WKB
-    ways_df = conn.execute("""
+    # Step 5: Determine polygon vs linestring using full OSM wiki rules
+    polygon_case = _build_polygon_case_sql()
+    ways_df = conn.execute(f"""
         WITH way_polygon_feature AS (
             SELECT id,
                 (ST_Equals(ST_StartPoint(linestring), ST_EndPoint(linestring))
                  AND tags IS NOT NULL
-                 AND NOT (
-                     list_contains(map_keys(tags), 'area')
-                     AND list_extract(map_extract(tags, 'area'), 1) = 'no'
-                 )
+                 AND ({polygon_case})
                 ) AS is_polygon
             FROM matching_ways_linestrings
         )
@@ -390,7 +437,7 @@ def _read_pbf_features_duckdb(
             wpf.is_polygon
         FROM matching_ways_linestrings mwl
         JOIN way_polygon_feature wpf ON mwl.id = wpf.id
-    """).fetchdf()
+    """).fetch_arrow_table()
 
     utils.log(f"Found {len(ways_df)} feature ways", level=lg.INFO)
 
@@ -556,11 +603,11 @@ def _read_pbf_features_duckdb(
         ) g
         JOIN matching_relations r ON r.id = g.id
         GROUP BY r.id, r.tags
-    """).fetchdf()
+    """).fetch_arrow_table()
 
     utils.log(f"Found {len(relations_df)} feature relations", level=lg.INFO)
 
-    if nodes_df.empty and ways_df.empty and relations_df.empty:
+    if len(nodes_df) == 0 and len(ways_df) == 0 and len(relations_df) == 0:
         msg = f"No feature data found in {pbf_path} for the specified area and tags"
         raise InsufficientResponseError(msg)
 

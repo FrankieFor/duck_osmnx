@@ -67,3 +67,7 @@ ci: pre-commit validate test-ci
 # clean temp files and build artifacts
 clean:
     rm -rf .coverage* .pytest_cache .temp dist docs/build */__pycache__
+
+# run pipeline benchmarks
+bench:
+    uv run python benchmarks/bench_pipeline.py

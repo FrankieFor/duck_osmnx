@@ -214,8 +214,22 @@ def add_edge_lengths(
     y = G.nodes(data="y")
     msg = "Some edges missing nodes, possibly due to input data clipping issue."
     try:
-        # two-dimensional array of coordinates: y0, x0, y1, x1
-        c = np.array([(y[u], x[u], y[v], x[v]) for u, v, k in uvk])
+        # vectorized extraction: build arrays of u/v node IDs, then look up coords
+        uvk_list = list(uvk)
+        u_arr = np.array([u for u, v, k in uvk_list], dtype=np.intp)
+        v_arr = np.array([v for u, v, k in uvk_list], dtype=np.intp)
+        y_dict = dict(y)
+        x_dict = dict(x)
+        y_arr = np.array(
+            [y_dict[n] for n in np.concatenate([u_arr, v_arr])],
+            dtype=np.float64,
+        )
+        x_arr = np.array(
+            [x_dict[n] for n in np.concatenate([u_arr, v_arr])],
+            dtype=np.float64,
+        )
+        n = len(u_arr)
+        c = np.column_stack([y_arr[:n], x_arr[:n], y_arr[n:], x_arr[n:]])
     except KeyError as e:  # pragma: no cover
         raise ValueError(msg) from e
     else:
@@ -226,7 +240,11 @@ def add_edge_lengths(
     # calculate great circle distances, round, and fill nulls with zeros
     dists = great_circle(c[:, 0], c[:, 1], c[:, 2], c[:, 3])
     dists[np.isnan(dists)] = 0
-    nx.set_edge_attributes(G, values=dict(zip(uvk, dists)), name="length")
+    nx.set_edge_attributes(
+        G,
+        values=dict(zip(uvk_list, dists, strict=True)),
+        name="length",
+    )
 
     msg = "Added length attributes to graph edges"
     utils.log(msg, level=lg.INFO)
