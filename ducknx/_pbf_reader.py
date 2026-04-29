@@ -130,6 +130,55 @@ def _build_tag_filter(tags: dict[str, bool | str | list[str]]) -> str:
     return " OR ".join(tag_conditions) if tag_conditions else "1=1"
 
 
+def _build_polygon_case_sql() -> str:
+    """
+    Build a SQL CASE expression implementing OSM polygon classification rules.
+
+    Translates the _POLYGON_FEATURES dict from features.py into a SQL CASE
+    expression that determines whether a closed way should be a Polygon.
+
+    Returns
+    -------
+    case_sql
+        SQL CASE expression returning TRUE/FALSE.
+    """
+    # Import inside function to avoid circular imports
+    from .features import _POLYGON_FEATURES  # noqa: PLC0415
+
+    conditions = []
+    # area=no always means not a polygon
+    conditions.append("WHEN tags['area'] = 'no' THEN FALSE")
+
+    for tag, rule_dict in _POLYGON_FEATURES.items():
+        escaped_tag = _duckdb._escape_sql(tag)
+        rule = rule_dict["polygon"]
+        if rule == "all":
+            conditions.append(f"WHEN tags['{escaped_tag}'] IS NOT NULL THEN TRUE")
+        elif rule == "passlist":
+            values = rule_dict.get("values", set())
+            if values:
+                escaped_vals = "', '".join(_duckdb._escape_sql(v) for v in sorted(values))
+                conditions.append(
+                    f"WHEN tags['{escaped_tag}'] IN ('{escaped_vals}') THEN TRUE",
+                )
+        elif rule == "blocklist":
+            values = rule_dict.get("values", set())
+            if values:
+                escaped_vals = "', '".join(_duckdb._escape_sql(v) for v in sorted(values))
+                conditions.append(
+                    f"WHEN tags['{escaped_tag}'] IS NOT NULL "
+                    f"AND tags['{escaped_tag}'] NOT IN ('{escaped_vals}') THEN TRUE",
+                )
+            else:
+                conditions.append(f"WHEN tags['{escaped_tag}'] IS NOT NULL THEN TRUE")
+
+    case_lines = "\n            ".join(conditions)
+    return f"""CASE
+            {case_lines}
+            ELSE FALSE
+        END"""
+
+
 def _read_pbf_network_duckdb(
     polygon: Polygon | MultiPolygon,
     network_type: str,
@@ -364,16 +413,14 @@ def _read_pbf_features_duckdb(
         GROUP BY tagged_ways.id, tagged_ways.tags, tagged_ways.refs
     """)
 
-    # Step 5: Determine polygon vs linestring and output WKB
-    ways_df = conn.execute("""
+    # Step 5: Determine polygon vs linestring using full OSM wiki rules
+    polygon_case = _build_polygon_case_sql()
+    ways_df = conn.execute(f"""
         WITH way_polygon_feature AS (
             SELECT id,
                 (ST_Equals(ST_StartPoint(linestring), ST_EndPoint(linestring))
                  AND tags IS NOT NULL
-                 AND NOT (
-                     list_contains(map_keys(tags), 'area')
-                     AND list_extract(map_extract(tags, 'area'), 1) = 'no'
-                 )
+                 AND ({polygon_case})
                 ) AS is_polygon
             FROM matching_ways_linestrings
         )

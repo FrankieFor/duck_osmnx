@@ -19,15 +19,11 @@ import logging as lg
 from typing import Any
 
 import geopandas as gpd
-import numpy as np
 import pandas as pd
 import pyarrow as pa
 import shapely
-from shapely import LineString
 from shapely import MultiPolygon
 from shapely import Polygon
-from shapely import wkb
-from shapely.errors import GEOSException
 
 from . import _pbf_reader
 from . import geocoder
@@ -461,7 +457,7 @@ def _create_gdf_from_dfs(
         node_result["geometry"] = node_geoms
         frames.append(node_result)
 
-    # Process ways — vectorized WKB parsing with polygon refinement
+    # Process ways — vectorized WKB parsing (polygon classification done in SQL)
     if not ways_df.empty:
         way_geoms = shapely.from_wkb(ways_df["geometry"].apply(bytes))
         way_tags_series = ways_df["tags"].apply(lambda t: dict(t) if t else {})
@@ -470,17 +466,6 @@ def _create_gdf_from_dfs(
             way_tags = way_tags.drop(columns=["geometry"])
 
         query_tag_keys = set(tags.keys())
-
-        # Vectorized polygon refinement: SQL marked is_polygon based on
-        # simplified rule; use full _POLYGON_FEATURES rules to fix.
-        is_polygon_arr = ways_df["is_polygon"].values
-        should_be_poly = way_tags_series.apply(_should_be_polygon).values
-        needs_fix = is_polygon_arr & ~should_be_poly
-        for idx in np.where(needs_fix)[0]:
-            try:
-                way_geoms[idx] = LineString(way_geoms[idx].exterior.coords)
-            except (AttributeError, GEOSException, ValueError):
-                pass  # keep as-is if conversion fails
 
         way_result = pd.DataFrame({
             "element": "way",
