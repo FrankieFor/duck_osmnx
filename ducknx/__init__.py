@@ -23,7 +23,6 @@ from . import features as features
 from . import geocoder as geocoder
 from . import graph as graph
 from . import io as io
-from . import plot as plot
 from . import projection as projection
 from . import routing as routing
 from . import settings as settings
@@ -33,5 +32,18 @@ from . import truncate as truncate
 from . import utils as utils
 from . import utils_geo as utils_geo
 
-# expose the old v1 API for backwards compatibility
+# expose top-level shortcut names (plot.* loaded lazily via _api_v1.__getattr__)
 from ._api_v1 import *  # noqa: F403
+
+
+def __getattr__(name: str) -> object:
+    """Lazy `dx.plot` access so importing ducknx does not require matplotlib."""
+    if name == "plot":
+        import importlib  # noqa: PLC0415
+
+        module = importlib.import_module("ducknx.plot")
+        globals()["plot"] = module
+        return module
+    from ._api_v1 import __getattr__ as _api_getattr  # noqa: PLC0415
+
+    return _api_getattr(name)

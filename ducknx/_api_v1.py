@@ -1,18 +1,22 @@
 # ruff: noqa: PLC0414
 """
-Expose the old v1 API for backwards compatibility.
+Expose the public package API.
 
-This allows common functionality to be accessed directly via the
-dx.function_name() shortcut by exposing these functions directly in the
-package's namespace.
+Public functions live in their topical submodules; this module
+re-exports the most common ones at the package root for the
+``dx.function_name(...)`` shorthand. Plot functions are routed via a
+lazy ``__getattr__`` so importing ``ducknx`` does not require
+``matplotlib``.
 """
+
+from __future__ import annotations
+
+from typing import Any
 
 from .bearing import add_edge_bearings as add_edge_bearings
 from .bearing import orientation_entropy as orientation_entropy
 from .convert import graph_from_arrow as graph_from_arrow
-from .convert import graph_from_gdfs as graph_from_gdfs
 from .convert import graph_to_arrow as graph_to_arrow
-from .convert import graph_to_gdfs as graph_to_gdfs
 from .distance import nearest_edges as nearest_edges
 from .distance import nearest_nodes as nearest_nodes
 from .elevation import add_edge_grades as add_edge_grades
@@ -34,12 +38,6 @@ from .io import load_graphml as load_graphml
 from .io import save_graph_geopackage as save_graph_geopackage
 from .io import save_graph_xml as save_graph_xml
 from .io import save_graphml as save_graphml
-from .plot import plot_figure_ground as plot_figure_ground
-from .plot import plot_footprints as plot_footprints
-from .plot import plot_graph as plot_graph
-from .plot import plot_graph_route as plot_graph_route
-from .plot import plot_graph_routes as plot_graph_routes
-from .plot import plot_orientation as plot_orientation
 from .projection import project_graph as project_graph
 from .routing import add_edge_speeds as add_edge_speeds
 from .routing import add_edge_travel_times as add_edge_travel_times
@@ -50,3 +48,22 @@ from .simplification import simplify_graph as simplify_graph
 from .stats import basic_stats as basic_stats
 from .utils import log as log
 from .utils import ts as ts
+
+_PLOT_NAMES = {
+    "plot_figure_ground",
+    "plot_footprints",
+    "plot_graph",
+    "plot_graph_route",
+    "plot_graph_routes",
+    "plot_orientation",
+}
+
+
+def __getattr__(name: str) -> Any:  # noqa: ANN401
+    """Lazy import for plot functions so ducknx stays import-light."""
+    if name in _PLOT_NAMES:
+        from . import plot  # noqa: PLC0415
+
+        return getattr(plot, name)
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
