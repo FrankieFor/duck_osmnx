@@ -12,6 +12,9 @@ from warnings import warn
 import geopandas as gpd
 import networkx as nx
 import pandas as pd
+import polars as pl
+import pyarrow as pa
+import shapely
 from shapely import LineString
 from shapely import Point
 
@@ -560,6 +563,305 @@ def _update_edge_keys(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
         G.add_edge(u, v, key=new_key, **G.get_edge_data(u, v, k))
         G.remove_edge(u, v, key=k)
 
+    return G
+
+
+def _wkb_field(name: str, crs: str | None) -> pa.Field:
+    """
+    Build a PyArrow field with geoarrow.wkb extension type metadata.
+
+    Parameters
+    ----------
+    name
+        Column name.
+    crs
+        Authority code string (e.g. ``"EPSG:4326"``) or ``None``.
+
+    Returns
+    -------
+    field
+        Arrow field carrying the geoarrow.wkb extension metadata.
+    """
+    crs_token = (crs or "").upper()
+    metadata = {
+        b"ARROW:extension:name": b"geoarrow.wkb",
+        b"ARROW:extension:metadata": (
+            b'{"crs":"' + crs_token.encode("ascii") + b'","edges":"planar"}'
+        ),
+    }
+    return pa.field(name, pa.binary(), nullable=True, metadata=metadata)
+
+
+def _attach_geoarrow(tbl: pa.Table, name: str, crs: str | None) -> pa.Table:
+    """
+    Replace the named binary column's field with a geoarrow.wkb field.
+
+    Parameters
+    ----------
+    tbl
+        Source Arrow table.
+    name
+        Column name to upgrade.
+    crs
+        CRS authority code; embedded in the field metadata.
+
+    Returns
+    -------
+    tbl
+        Table with the named column carrying geoarrow.wkb metadata.
+    """
+    if name not in tbl.column_names:
+        return tbl
+    fields = list(tbl.schema)
+    idx = tbl.schema.get_field_index(name)
+    fields[idx] = _wkb_field(name, crs)
+    new_schema = pa.schema(fields, metadata=tbl.schema.metadata)
+    return tbl.cast(new_schema, safe=False)
+
+
+def _crs_token(crs: Any) -> str | None:  # noqa: ANN401
+    """
+    Coerce a CRS-like object to an authority-code string.
+
+    Parameters
+    ----------
+    crs
+        A pyproj CRS, an EPSG-style string, or ``None``.
+
+    Returns
+    -------
+    token
+        e.g. ``"EPSG:4326"`` or ``None`` if unknown.
+    """
+    if crs is None:
+        return None
+    if isinstance(crs, str):
+        return crs.upper()
+    # pyproj.CRS or similar — try the to_string variants
+    for attr in ("to_string", "srs"):
+        if hasattr(crs, attr):
+            value = getattr(crs, attr)
+            value = value() if callable(value) else value
+            if isinstance(value, str) and value:
+                return value.upper()
+    return str(crs)
+
+
+@overload
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> tuple[pa.Table, pa.Table]: ...
+
+
+@overload
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    nodes: Literal[True],
+    edges: Literal[True],
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> tuple[pa.Table, pa.Table]: ...
+
+
+@overload
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    nodes: Literal[True],
+    edges: Literal[False],
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> pa.Table: ...
+
+
+@overload
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    nodes: Literal[False],
+    edges: Literal[True],
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> pa.Table: ...
+
+
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    nodes: bool = True,
+    edges: bool = True,
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> pa.Table | tuple[pa.Table, pa.Table]:
+    """
+    Convert a graph to node and/or edge Arrow tables.
+
+    Returns the Arrow analog of ``graph_to_gdfs``: nodes and edges as
+    ``pa.Table``s with a ``geoarrow.wkb`` ``geometry`` column carrying CRS
+    metadata. Node identifiers ride in an ``osmid`` column; edge endpoints
+    ride in ``u``, ``v``, ``key`` columns. All other node/edge attributes
+    are preserved as columns; types are inferred via Polars and converted
+    to Arrow.
+
+    Parameters
+    ----------
+    G
+        Input graph.
+    nodes
+        If True, emit a nodes Arrow table.
+    edges
+        If True, emit an edges Arrow table.
+    node_geometry
+        If True, attach a ``geometry`` column built from each node's
+        ``x``/``y`` attributes.
+    fill_edge_geometry
+        If True, synthesize a LineString edge ``geometry`` from endpoint
+        node coordinates when the edge does not already carry one.
+
+    Returns
+    -------
+    nodes_tbl or edges_tbl or (nodes_tbl, edges_tbl)
+        Arrow tables matching the requested outputs.
+    """
+    crs = _crs_token(G.graph.get("crs"))
+
+    nodes_tbl: pa.Table | None = None
+    edges_tbl: pa.Table | None = None
+
+    if nodes:
+        if len(G.nodes) == 0:  # pragma: no cover
+            msg = "Graph contains no nodes."
+            raise ValueError(msg)
+
+        node_rows = [{"osmid": n, **data} for n, data in G.nodes(data=True)]
+        nodes_df = pl.DataFrame(node_rows, infer_schema_length=None)
+
+        if node_geometry:
+            xs = nodes_df.get_column("x").to_numpy()
+            ys = nodes_df.get_column("y").to_numpy()
+            wkbs = shapely.to_wkb(shapely.points(xs, ys))
+            nodes_df = nodes_df.with_columns(pl.Series("geometry", wkbs, dtype=pl.Binary))
+
+        nodes_tbl = nodes_df.to_arrow()
+        if node_geometry:
+            nodes_tbl = _attach_geoarrow(nodes_tbl, "geometry", crs)
+        utils.log("Created nodes Arrow table from graph", level=lg.INFO)
+
+    if edges:
+        if len(G.edges) == 0:  # pragma: no cover
+            msg = "Graph contains no edges."
+            raise ValueError(msg)
+
+        node_coords = {n: (G.nodes[n]["x"], G.nodes[n]["y"]) for n in G}
+        edge_rows: list[dict[str, Any]] = []
+        for u, v, k, data in G.edges(keys=True, data=True):
+            row: dict[str, Any] = {"u": u, "v": v, "key": k, **data}
+            geom = data.get("geometry")
+            if geom is None and fill_edge_geometry:
+                geom = LineString((node_coords[u], node_coords[v]))
+            row["geometry"] = shapely.to_wkb(geom) if geom is not None else None
+            edge_rows.append(row)
+
+        edges_df = pl.DataFrame(edge_rows, infer_schema_length=None)
+        edges_tbl = edges_df.to_arrow()
+        edges_tbl = _attach_geoarrow(edges_tbl, "geometry", crs)
+        utils.log("Created edges Arrow table from graph", level=lg.INFO)
+
+    if nodes and edges:
+        return nodes_tbl, edges_tbl  # type: ignore[return-value]
+    if nodes:
+        return nodes_tbl  # type: ignore[return-value]
+    if edges:
+        return edges_tbl  # type: ignore[return-value]
+    msg = "You must request nodes or edges or both."
+    raise ValueError(msg)
+
+
+def graph_from_arrow(  # noqa: PLR0912
+    nodes_tbl: pa.Table,
+    edges_tbl: pa.Table,
+    *,
+    graph_attrs: dict[str, Any] | None = None,
+) -> nx.MultiDiGraph:
+    """
+    Convert node/edge Arrow tables into a MultiDiGraph.
+
+    Inverse of ``graph_to_arrow``. ``nodes_tbl`` must have an ``osmid``
+    column and contain ``x``/``y`` columns; ``edges_tbl`` must have
+    ``u``, ``v``, ``key`` columns. Any ``geometry`` column is interpreted
+    as WKB (geoarrow.wkb) and decoded into shapely geometries.
+
+    Parameters
+    ----------
+    nodes_tbl
+        Arrow table of nodes. Must contain ``osmid``, ``x``, ``y``.
+    edges_tbl
+        Arrow table of edges. Must contain ``u``, ``v``, ``key``.
+    graph_attrs
+        Optional ``G.graph`` attribute dict. If ``None``, the CRS is
+        recovered from the geometry column metadata.
+
+    Returns
+    -------
+    G
+        The reconstructed MultiDiGraph.
+    """
+    for required in ("osmid", "x", "y"):
+        if required not in nodes_tbl.column_names:
+            msg = f"`nodes_tbl` must contain `{required}` column."
+            raise ValueError(msg)
+    for required in ("u", "v", "key"):
+        if required not in edges_tbl.column_names:
+            msg = f"`edges_tbl` must contain `{required}` column."
+            raise ValueError(msg)
+
+    if graph_attrs is None:
+        meta = (edges_tbl.schema.field("geometry").metadata
+                if "geometry" in edges_tbl.column_names else None) or {}
+        ext_meta = meta.get(b"ARROW:extension:metadata", b"")
+        crs = None
+        if b'"crs":"' in ext_meta:
+            start = ext_meta.find(b'"crs":"') + len(b'"crs":"')
+            end = ext_meta.find(b'"', start)
+            crs_value = ext_meta[start:end].decode("ascii")
+            if crs_value:
+                crs = crs_value
+        graph_attrs = {"crs": crs} if crs else {}
+
+    G = nx.MultiDiGraph(**graph_attrs)
+
+    nodes_rows = nodes_tbl.to_pylist()
+    edges_rows = edges_tbl.to_pylist()
+
+    geom_in_nodes = "geometry" in nodes_tbl.column_names
+    geom_in_edges = "geometry" in edges_tbl.column_names
+
+    for row in edges_rows:
+        u = row.pop("u")
+        v = row.pop("v")
+        k = row.pop("key")
+        if geom_in_edges:
+            wkb = row.get("geometry")
+            row["geometry"] = shapely.from_wkb(wkb) if wkb is not None else None
+        # drop nulls so edges only get attributes with non-null values
+        attrs = {key: val for key, val in row.items() if val is not None}
+        G.add_edge(u, v, key=k, **attrs)
+
+    for row in nodes_rows:
+        osmid = row.pop("osmid")
+        if geom_in_nodes:
+            row.pop("geometry", None)  # x/y are authoritative
+        attrs = {key: val for key, val in row.items() if val is not None}
+        if osmid in G.nodes:
+            G.nodes[osmid].update(attrs)
+        else:
+            G.add_node(osmid, **attrs)
+
+    utils.log("Created graph from node/edge Arrow tables", level=lg.INFO)
     return G
 
 

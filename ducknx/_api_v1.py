@@ -9,7 +9,9 @@ package's namespace.
 
 from .bearing import add_edge_bearings as add_edge_bearings
 from .bearing import orientation_entropy as orientation_entropy
+from .convert import graph_from_arrow as graph_from_arrow
 from .convert import graph_from_gdfs as graph_from_gdfs
+from .convert import graph_to_arrow as graph_to_arrow
 from .convert import graph_to_gdfs as graph_to_gdfs
 from .distance import nearest_edges as nearest_edges
 from .distance import nearest_nodes as nearest_nodes
