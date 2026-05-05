@@ -25,11 +25,13 @@ classifiers = [
 ]
 dependencies = [
   "duckdb>=1.4.4",
+  "geoarrow-pyarrow>=0.2.0",
   "geopandas>=1.1.2",
   "httpx>=0.28.1",
   "networkx>=2.5",
   "numpy>=1.24",
   "pandas>=2.0",
+  "polars>=1.40.1",
   "pyarrow>=23.0.0",
   "shapely>=2.0",
 ]
