@@ -6,8 +6,10 @@ import logging as lg
 from typing import TYPE_CHECKING
 
 import networkx as nx
+import numpy as np
+import shapely
+from shapely import STRtree
 
-from . import convert
 from . import utils
 from . import utils_geo
 
@@ -123,18 +125,26 @@ def truncate_graph_polygon(
     msg = "Identifying all nodes that lie outside the polygon..."
     utils.log(msg, level=lg.INFO)
 
-    # first identify all nodes whose point geometries lie within the polygon
-    gs_nodes = convert.graph_to_gdfs(G, edges=False)["geometry"]
-    to_keep = utils_geo._intersect_index_quadrats(gs_nodes, polygon)
+    # build node Points directly from G's x/y attributes — no GeoDataFrame needed
+    node_ids = np.fromiter(G.nodes, dtype=np.int64, count=len(G.nodes))
+    xs = np.fromiter((G.nodes[n]["x"] for n in node_ids), dtype=np.float64,
+                     count=len(node_ids))
+    ys = np.fromiter((G.nodes[n]["y"] for n in node_ids), dtype=np.float64,
+                     count=len(node_ids))
+    node_points = shapely.points(xs, ys)
 
-    if len(to_keep) == 0:
+    # spatial index → which node points fall inside the polygon
+    tree = STRtree(node_points)
+    inside_idx = tree.query(polygon, predicate="intersects")
+    inside_mask = np.zeros(len(node_points), dtype=bool)
+    inside_mask[inside_idx] = True
+
+    if not inside_mask.any():
         # no graph nodes within the polygon: can't create a graph from that
         msg = "Found no graph nodes within the requested polygon."
         raise ValueError(msg)
 
-    # now identify all nodes whose point geometries lie outside the polygon
-    gs_nodes_outside_poly = gs_nodes[~gs_nodes.index.isin(to_keep)]
-    nodes_outside_poly = set(gs_nodes_outside_poly.index)
+    nodes_outside_poly = set(node_ids[~inside_mask].tolist())
 
     if truncate_by_edge:
         # retain nodes outside boundary polygon if at least one of node's

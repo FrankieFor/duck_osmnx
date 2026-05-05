@@ -6,13 +6,15 @@ import logging as lg
 from typing import TYPE_CHECKING
 from typing import Any
 
-import geopandas as gpd
 import networkx as nx
-import pandas as pd
+import numpy as np
+import polars as pl
+import pyarrow as pa
+import shapely
 from shapely import LineString
 from shapely import Point
+from shapely import STRtree
 
-from . import convert
 from . import stats
 from . import utils
 from ._errors import GraphSimplificationError
@@ -483,7 +485,7 @@ def consolidate_intersections(
     dead_ends: bool = False,
     reconnect_edges: bool = True,
     node_attr_aggs: dict[str, Any] | None = None,
-) -> nx.MultiDiGraph | gpd.GeoSeries:
+) -> nx.MultiDiGraph | pa.Table:
     """
     Consolidate intersections comprising clusters of nearby nodes.
 
@@ -551,11 +553,12 @@ def consolidate_intersections(
 
     Returns
     -------
-    Gc or gs
+    Gc or table
         If `rebuild_graph=True`, returns MultiDiGraph with consolidated
         intersections and (optionally) reconnected edge geometries. If
-        `rebuild_graph=False`, returns GeoSeries of Points representing the
-        centroids of street intersections.
+        `rebuild_graph=False`, returns a single-column ``pa.Table``
+        (column ``geometry``, geoarrow.wkb) holding the centroid Points
+        of the merged intersections.
     """
     # make a copy to not mutate original graph object caller passed in
     G = G.copy()
@@ -580,64 +583,157 @@ def consolidate_intersections(
         )
 
     # otherwise, if we're not rebuilding the graph
+    crs = G.graph.get("crs")
     if len(G) == 0:
-        # if graph has no nodes, just return empty GeoSeries
-        return gpd.GeoSeries(crs=G.graph["crs"])
+        # if graph has no nodes, just return empty geoarrow table
+        return _empty_geoarrow_table(crs)
 
     # otherwise, return the centroids of the merged intersection polygons
-    return _merge_nodes_geometric(G, tolerance).centroid
+    cluster_geoms = _merge_nodes_geometric(G, tolerance)
+    centroids = shapely.centroid(cluster_geoms)
+    return _points_to_arrow(centroids, crs)
+
+
+def _wkb_geom_field(crs: str | None) -> pa.Field:
+    """
+    Build a `geometry` field carrying geoarrow.wkb extension metadata.
+
+    Parameters
+    ----------
+    crs
+        CRS authority code string (e.g. ``"EPSG:4326"``) or ``None``.
+
+    Returns
+    -------
+    field
+        Arrow field tagged with the geoarrow.wkb extension type.
+    """
+    if crs is None:
+        crs_token = ""
+    elif isinstance(crs, str):
+        crs_token = crs.upper()
+    else:
+        # pyproj.CRS or similar — fall back to its string form
+        for attr in ("to_string", "srs"):
+            if hasattr(crs, attr):
+                value = getattr(crs, attr)
+                value = value() if callable(value) else value
+                if isinstance(value, str) and value:
+                    crs_token = value.upper()
+                    break
+        else:
+            crs_token = str(crs).upper()
+    metadata = {
+        b"ARROW:extension:name": b"geoarrow.wkb",
+        b"ARROW:extension:metadata": (
+            b'{"crs":"' + crs_token.encode("ascii") + b'","edges":"planar"}'
+        ),
+    }
+    return pa.field("geometry", pa.binary(), nullable=True, metadata=metadata)
+
+
+def _points_to_arrow(geoms: np.ndarray, crs: str | None) -> pa.Table:
+    """
+    Wrap a numpy array of shapely geometries in a single-column Arrow table.
+
+    Parameters
+    ----------
+    geoms
+        Shapely geometries.
+    crs
+        CRS to embed in the geometry field metadata.
+
+    Returns
+    -------
+    table
+        ``pa.Table`` with a single ``geometry`` column (geoarrow.wkb).
+    """
+    wkbs = shapely.to_wkb(geoms)
+    arr = pa.array(wkbs, type=pa.binary())
+    return pa.Table.from_arrays([arr], schema=pa.schema([_wkb_geom_field(crs)]))
+
+
+def _empty_geoarrow_table(crs: str | None) -> pa.Table:
+    """Return an empty geoarrow.wkb-typed table for empty-graph fallbacks."""
+    return pa.Table.from_arrays(
+        [pa.array([], type=pa.binary())],
+        schema=pa.schema([_wkb_geom_field(crs)]),
+    )
+
+
+def _node_arrays(G: nx.MultiDiGraph) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Extract aligned ``(osmids, xs, ys)`` numpy arrays from a graph's nodes.
+
+    Parameters
+    ----------
+    G
+        Input graph.
+
+    Returns
+    -------
+    osmids, xs, ys
+        Parallel arrays in graph node order.
+    """
+    osmids = np.fromiter(G.nodes, dtype=np.int64, count=len(G.nodes))
+    xs = np.fromiter((G.nodes[n]["x"] for n in osmids), dtype=np.float64,
+                     count=len(osmids))
+    ys = np.fromiter((G.nodes[n]["y"] for n in osmids), dtype=np.float64,
+                     count=len(osmids))
+    return osmids, xs, ys
 
 
 def _merge_nodes_geometric(
     G: nx.MultiDiGraph,
     tolerance: float | dict[int, float],
-    gdf_nodes: gpd.GeoDataFrame | None = None,
-) -> gpd.GeoSeries:
+) -> np.ndarray:
     """
     Geometrically merge nodes within some distance of each other.
+
+    Buffers each node by ``tolerance`` (or the per-node value from a dict)
+    and unions overlapping buffers into cluster polygons.
 
     Parameters
     ----------
     G
         A projected graph.
     tolerance
-        Nodes are buffered to this distance (in graph's geometry's units) and
-        subsequent overlaps are dissolved into a single node. If scalar, then
-        that single value will be used for all nodes. If dict (mapping node
-        IDs to individual values), then those values will be used per node and
-        any missing node IDs will not be buffered.
-    gdf_nodes
-        Pre-computed node GeoDataFrame from `graph_to_gdfs`. If None, it will
-        be computed from `G`.
+        Per-node buffering radius in graph CRS units; scalar or dict
+        keyed by node ID.
 
     Returns
     -------
-    merged
-        The merged overlapping polygons of the buffered nodes.
+    cluster_geoms
+        Numpy array of the merged cluster geometries.
     """
-    if gdf_nodes is None:
-        gdf_nodes = convert.graph_to_gdfs(G, edges=False)
+    osmids, xs, ys = _node_arrays(G)
+    points = shapely.points(xs, ys)
 
     if isinstance(tolerance, dict):
-        # create series of tolerances reindexed like nodes, then buffer, then
-        # fill nulls (resulting from missing tolerances) with original points,
-        # then merge overlapping geometries
-        tols = pd.Series(tolerance).reindex(gdf_nodes.index)
-        merged = gdf_nodes.buffer(tols).fillna(gdf_nodes["geometry"]).union_all()
+        tols = np.array([tolerance.get(int(o), np.nan) for o in osmids],
+                        dtype=np.float64)
+        valid = ~np.isnan(tols)
+        # buffer where a tolerance is provided, otherwise keep the bare point
+        buffered = np.where(
+            valid,
+            shapely.buffer(points, np.where(valid, tols, 0.0)),
+            points,
+        )
     else:
-        # buffer nodes then merge overlapping geometries
-        merged = gdf_nodes.buffer(tolerance).union_all()
+        buffered = shapely.buffer(points, tolerance)
 
-    # extract the member geometries if it's a multi-geometry
-    merged = merged.geoms if hasattr(merged, "geoms") else merged
-    return gpd.GeoSeries(merged, crs=G.graph["crs"])
+    merged = shapely.union_all(buffered)
+    if merged is None or merged.is_empty:
+        return np.empty(0, dtype=object)
+    if hasattr(merged, "geoms"):
+        return np.asarray(list(merged.geoms), dtype=object)
+    return np.asarray([merged], dtype=object)
 
 
 def _split_disconnected_clusters(
-    gdf: gpd.GeoDataFrame,
-    node_points: gpd.GeoDataFrame,
+    cluster_df: pl.DataFrame,
     G: nx.MultiDiGraph,
-) -> gpd.GeoDataFrame:
+) -> pl.DataFrame:
     """
     Split disconnected clusters into connected subclusters.
 
@@ -656,146 +752,221 @@ def _split_disconnected_clusters(
 
     Returns
     -------
-    gdf
-        Updated GeoDataFrame with disconnected clusters split into
-        subclusters and unique integer cluster IDs.
+    cluster_df
+        Polars DataFrame (`osmid`, `x`, `y`, `cluster`) with disconnected
+        clusters split into subclusters and unique integer cluster IDs.
     """
-    for cluster_label, nodes_subset in gdf.groupby("cluster"):
-        if len(nodes_subset) > 1:
-            # identify all the (weakly connected) component in cluster
-            wccs = list(nx.weakly_connected_components(G.subgraph(nodes_subset.index)))
-            if len(wccs) > 1:
-                # if there are multiple components in this cluster
-                for suffix, wcc in enumerate(wccs):
-                    # set subcluster xy to the centroid of just these nodes
-                    idx = list(wcc)
-                    subcluster_centroid = node_points.loc[idx].union_all().centroid
-                    gdf.loc[idx, "x"] = subcluster_centroid.x
-                    gdf.loc[idx, "y"] = subcluster_centroid.y
-                    # move to subcluster by appending suffix to cluster label
-                    gdf.loc[idx, "cluster"] = f"{cluster_label}-{suffix}"
+    rows = cluster_df.to_dicts()
+    by_cluster: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_cluster.setdefault(row["cluster"], []).append(row)
 
-    # give nodes unique integer IDs (subclusters with suffixes are strings)
-    gdf["cluster"] = gdf["cluster"].factorize()[0]
-    return gdf
+    new_label_seq = 0
+    relabeled: list[dict[str, Any]] = []
+    for nodes_subset in by_cluster.values():
+        osmids = [row["osmid"] for row in nodes_subset]
+        if len(osmids) > 1:
+            wccs = list(nx.weakly_connected_components(G.subgraph(osmids)))
+            if len(wccs) > 1:
+                # multiple weakly-connected components in one cluster: split
+                node_to_wcc = {n: idx for idx, wcc in enumerate(wccs) for n in wcc}
+                # group rows by wcc, assign each its own new label + centroid
+                wcc_groups: dict[int, list[dict[str, Any]]] = {}
+                for row in nodes_subset:
+                    wcc_groups.setdefault(node_to_wcc[row["osmid"]], []).append(row)
+                for group in wcc_groups.values():
+                    pts = shapely.points(
+                        np.array([r["x"] for r in group], dtype=np.float64),
+                        np.array([r["y"] for r in group], dtype=np.float64),
+                    )
+                    centroid = shapely.union_all(pts).centroid
+                    for r in group:
+                        r["x"] = float(centroid.x)
+                        r["y"] = float(centroid.y)
+                        r["cluster"] = new_label_seq
+                    new_label_seq += 1
+                    relabeled.extend(group)
+                continue
+        for row in nodes_subset:
+            row["cluster"] = new_label_seq
+        new_label_seq += 1
+        relabeled.extend(nodes_subset)
+
+    return pl.DataFrame(relabeled, schema=cluster_df.schema)
+
+
+def _aggregate_cluster_attrs(
+    osmids: list[int],
+    G: nx.MultiDiGraph,
+    cluster_xy: tuple[float, float],
+    node_attr_aggs: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Aggregate attribute values across the OSM nodes in a single cluster.
+
+    Mirrors the legacy GeoDataFrame ``groupby + agg`` semantics without
+    requiring pandas: collects per-attribute lists of non-null values from
+    ``G.nodes``, then either applies the user's aggregation function,
+    keeps the single unique value, or returns a list of unique values.
+
+    Parameters
+    ----------
+    osmids
+        OSM node IDs participating in this cluster.
+    G
+        The original projected graph.
+    cluster_xy
+        ``(x, y)`` coordinate to set on the merged node.
+    node_attr_aggs
+        Mapping from attribute name to aggregation function.
+
+    Returns
+    -------
+    attrs
+        Attribute dict for the new merged node.
+    """
+    x, y = cluster_xy
+    attrs: dict[str, Any] = {"osmid_original": list(osmids), "x": x, "y": y}
+
+    # collect per-attr non-null values across all merged nodes
+    per_attr: dict[str, list[Any]] = {}
+    for osmid in osmids:
+        for key, val in G.nodes[osmid].items():
+            if val is None:
+                continue
+            per_attr.setdefault(key, []).append(val)
+
+    for key, values in per_attr.items():
+        if key in {"x", "y", "osmid_original"}:
+            continue
+        if key in node_attr_aggs:
+            agg = node_attr_aggs[key]
+            try:
+                attrs[key] = agg(values) if callable(agg) else _named_agg(agg, values)
+            except (TypeError, ValueError):
+                attrs[key] = values
+            continue
+        if key == "street_count":
+            # recomputed downstream from the consolidated graph
+            continue
+        unique_vals = list(dict.fromkeys(values))
+        if len(unique_vals) == 1:
+            attrs[key] = unique_vals[0]
+        elif len(unique_vals) > 1:
+            attrs[key] = unique_vals
+    return attrs
+
+
+def _named_agg(name: str, values: list[Any]) -> Any:  # noqa: ANN401
+    """
+    Apply a string-named aggregation (``"mean"``, ``"sum"``, ...) to values.
+
+    Parameters
+    ----------
+    name
+        Aggregation name as accepted by ``polars.Series.<agg>``.
+    values
+        Collected non-null values.
+
+    Returns
+    -------
+    result
+        The aggregated value.
+    """
+    series = pl.Series(values=values)
+    method = getattr(series, name)
+    return method()
 
 
 def _build_consolidated_nodes(
     Gc: nx.MultiDiGraph,
-    gdf: gpd.GeoDataFrame,
+    cluster_df: pl.DataFrame,
     G: nx.MultiDiGraph,
     node_attr_aggs: dict[str, Any],
 ) -> None:
     """
-    Create a new node in Gc for each cluster of merged nodes.
+    Create a new node in ``Gc`` for each cluster in ``cluster_df``.
 
     Parameters
     ----------
     Gc
-        The new consolidated graph to add nodes to.
-    gdf
-        Node-to-cluster mapping GeoDataFrame.
+        The new consolidated graph to populate.
+    cluster_df
+        Polars DataFrame with columns ``osmid``, ``x``, ``y``, ``cluster``.
     G
         The original projected graph.
     node_attr_aggs
         Node attribute aggregation functions.
     """
-    groups = gdf.groupby("cluster")
-    for cluster_label, nodes_subset in groups:
-        osmids = nodes_subset.index.to_list()
+    rows = cluster_df.to_dicts()
+    by_cluster: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_cluster.setdefault(row["cluster"], []).append(row)
+
+    for cluster_label, nodes_subset in by_cluster.items():
+        osmids = [row["osmid"] for row in nodes_subset]
         if len(osmids) == 1:
-            # if cluster is a single node, add that node to new graph
-            osmid = osmids[0]
-            Gc.add_node(cluster_label, osmid_original=osmid, **G.nodes[osmid])
+            Gc.add_node(cluster_label, osmid_original=osmids[0], **G.nodes[osmids[0]])
         else:
-            # if cluster is multiple merged nodes, create one new node with
-            # attributes to represent the merged nodes' non-null values
-            node_attrs = {
-                "osmid_original": osmids,
-                "x": nodes_subset["x"].iloc[0],
-                "y": nodes_subset["y"].iloc[0],
-            }
-            for col in set(nodes_subset.columns):
-                # get the unique non-null values (we won't add null attrs)
-                unique_vals = list(dict.fromkeys(nodes_subset[col].dropna()))
-                if len(unique_vals) > 0 and col in node_attr_aggs:
-                    # if this attribute's values must be aggregated, do so now
-                    node_attrs[col] = nodes_subset[col].agg(node_attr_aggs[col])
-                elif col == "street_count":
-                    # if user doesn't specifically handle street_count with an
-                    # agg function, just skip it here then calculate it later
-                    continue
-                elif len(unique_vals) == 1:
-                    # if there's 1 unique value for this attribute, keep it
-                    node_attrs[col] = unique_vals[0]
-                elif len(unique_vals) > 1:
-                    # if there are multiple unique values, keep one of each
-                    node_attrs[col] = unique_vals
-            Gc.add_node(cluster_label, **node_attrs)
+            xy = (nodes_subset[0]["x"], nodes_subset[0]["y"])
+            attrs = _aggregate_cluster_attrs(osmids, G, xy, node_attr_aggs)
+            Gc.add_node(cluster_label, **attrs)
 
 
 def _reconnect_edges_to_clusters(
     Gc: nx.MultiDiGraph,
-    gdf: gpd.GeoDataFrame,
+    cluster_df: pl.DataFrame,
     G: nx.MultiDiGraph,
-    gdf_edges: gpd.GeoDataFrame,
 ) -> None:
     """
     Create edges between clusters and extend geometries to new node points.
-
-    For each edge in the original graph, create a corresponding edge between
-    the clusters. Then for every group of merged nodes with more than 1 node,
-    extend the edge geometries to reach the new node point.
 
     Parameters
     ----------
     Gc
         The new consolidated graph to add edges to.
-    gdf
-        Node-to-cluster mapping GeoDataFrame.
+    cluster_df
+        Polars DataFrame with columns ``osmid``, ``cluster``.
     G
         The original projected graph.
-    gdf_edges
-        Edge GeoDataFrame from the original graph.
     """
-    # create new edge from cluster to cluster for each edge in original graph
-    for u, v, k, data in G.edges(keys=True, data=True):
-        u2 = gdf.loc[u, "cluster"]
-        v2 = gdf.loc[v, "cluster"]
+    # osmid → cluster id lookup
+    osmid_to_cluster = dict(zip(
+        cluster_df.get_column("osmid").to_list(),
+        cluster_df.get_column("cluster").to_list(),
+        strict=True,
+    ))
 
-        # only create the edge if we're not connecting the cluster
-        # to itself, but always add original self-loops
+    # create cluster-to-cluster edge for each original edge
+    for u, v, _k, data in G.edges(keys=True, data=True):
+        u2 = osmid_to_cluster[u]
+        v2 = osmid_to_cluster[v]
         if (u2 != v2) or (u == v):
             data["u_original"] = u
             data["v_original"] = v
             if "geometry" not in data:
-                data["geometry"] = gdf_edges.loc[(u, v, k), "geometry"]
+                data["geometry"] = LineString((
+                    (G.nodes[u]["x"], G.nodes[u]["y"]),
+                    (G.nodes[v]["x"], G.nodes[v]["y"]),
+                ))
             Gc.add_edge(u2, v2, **data)
 
-    # for every group of merged nodes with more than 1 node in it, extend the
-    # edge geometries to reach the new node point
-    for cluster_label, nodes_subset in gdf.groupby("cluster"):
-        # but only if there were multiple nodes merged together,
-        # otherwise it's the same old edge as in original graph
-        if len(nodes_subset) > 1:
-            # get coords of merged nodes point centroid to prepend or
-            # append to the old edge geom's coords
-            x = Gc.nodes[cluster_label]["x"]
-            y = Gc.nodes[cluster_label]["y"]
-            xy = [(x, y)]
-
-            # for each edge incident on this new merged node, update its
-            # geometry to extend to/from the new node's point coords
-            in_edges = set(Gc.in_edges(cluster_label, keys=True))
-            out_edges = set(Gc.out_edges(cluster_label, keys=True))
-            for u, v, k in in_edges | out_edges:
-                old_coords = list(Gc.edges[u, v, k]["geometry"].coords)
-                new_coords = xy + old_coords if cluster_label == u else old_coords + xy
-                new_geom = LineString(new_coords)
-                Gc.edges[u, v, k]["geometry"] = new_geom
-
-                # update the edge length attribute, given the new geometry
-                Gc.edges[u, v, k]["length"] = new_geom.length
+    # extend incident edge geometries for clusters that swallowed >1 node
+    sizes = (
+        cluster_df.group_by("cluster").len().rename({"len": "n"}).filter(pl.col("n") > 1)
+    )
+    for cluster_label in sizes.get_column("cluster").to_list():
+        x = Gc.nodes[cluster_label]["x"]
+        y = Gc.nodes[cluster_label]["y"]
+        xy = [(x, y)]
+        in_edges = set(Gc.in_edges(cluster_label, keys=True))
+        out_edges = set(Gc.out_edges(cluster_label, keys=True))
+        for u, v, k in in_edges | out_edges:
+            old_coords = list(Gc.edges[u, v, k]["geometry"].coords)
+            new_coords = xy + old_coords if cluster_label == u else old_coords + xy
+            new_geom = LineString(new_coords)
+            Gc.edges[u, v, k]["geometry"] = new_geom
+            Gc.edges[u, v, k]["length"] = new_geom.length
 
 
 def _consolidate_intersections_rebuild_graph(
@@ -842,59 +1013,57 @@ def _consolidate_intersections_rebuild_graph(
         msg = "This graph has already been consolidated, cannot consolidate it again."
         raise GraphSimplificationError(msg)
 
-    # default node attributes to aggregate upon consolidation
     if node_attr_aggs is None:
         node_attr_aggs = {"elevation": "mean"}
 
-    # compute node and edge GeoDataFrames once for reuse
-    gdf_nodes = convert.graph_to_gdfs(G, edges=False)
+    # STEP 1: buffer nodes, dissolve overlaps → cluster polygons
+    cluster_geoms = _merge_nodes_geometric(G, tolerance)
+    cluster_centroids = shapely.centroid(cluster_geoms)
+    cluster_xs = shapely.get_x(cluster_centroids)
+    cluster_ys = shapely.get_y(cluster_centroids)
 
-    # STEP 1
-    # buffer nodes to passed-in distance and merge overlaps. turn merged nodes
-    # into gdf and get centroids of each cluster as x, y
-    node_clusters = gpd.GeoDataFrame(
-        geometry=_merge_nodes_geometric(G, tolerance, gdf_nodes=gdf_nodes),
-    )
-    centroids = node_clusters.centroid
-    node_clusters["x"] = centroids.x
-    node_clusters["y"] = centroids.y
+    # STEP 2: assign each original node to the cluster polygon containing it
+    osmids, node_xs, node_ys = _node_arrays(G)
+    node_points = shapely.points(node_xs, node_ys)
+    tree = STRtree(cluster_geoms)
+    # query returns 2 x N array: [tree_idx, geom_idx]; nearest=False means
+    # we get all overlap pairs.
+    pairs = tree.query(node_points, predicate="within")
+    # pairs[0] = input (node) indices, pairs[1] = tree (cluster) indices
+    cluster_assignment = np.full(len(osmids), -1, dtype=np.int64)
+    cluster_assignment[pairs[0]] = pairs[1]
+    if (cluster_assignment < 0).any():
+        # handle nodes that fell on cluster boundaries (rare): nearest-cluster fallback
+        for missing_idx in np.where(cluster_assignment < 0)[0]:
+            nearest = tree.nearest(node_points[missing_idx])
+            cluster_assignment[missing_idx] = int(nearest)
 
-    # STEP 2
-    # attach each node to its cluster of merged nodes. first get the original
-    # graph's node points then spatial join to give each node the label of
-    # cluster it's within. make cluster labels type string.
-    node_points = gdf_nodes.drop(columns=["x", "y"])
-    gdf = gpd.sjoin(node_points, node_clusters, how="left", predicate="within")
-    gdf = gdf.drop(columns="geometry").rename(columns={"index_right": "cluster"})
-    gdf["cluster"] = gdf["cluster"].astype(str)
+    cluster_df = pl.DataFrame({
+        "osmid": osmids,
+        "x": cluster_xs[cluster_assignment],
+        "y": cluster_ys[cluster_assignment],
+        "cluster": cluster_assignment,
+    })
 
-    # STEP 3
-    # split disconnected clusters into connected subclusters
-    gdf = _split_disconnected_clusters(gdf, node_points, G)
+    # STEP 3: split disconnected clusters into connected subclusters
+    cluster_df = _split_disconnected_clusters(cluster_df, G)
 
-    # STEP 4
-    # create new empty graph and copy over misc graph data
+    # STEP 4: new empty graph carrying over G.graph
     Gc = nx.MultiDiGraph()
     Gc.graph = G.graph
 
-    # STEP 5
-    # create a new node for each cluster of merged nodes
-    _build_consolidated_nodes(Gc, gdf, G, node_attr_aggs)
+    # STEP 5: one new node per cluster, with attribute aggregation
+    _build_consolidated_nodes(Gc, cluster_df, G, node_attr_aggs)
 
-    # mark the graph as having been consolidated
     G.graph["consolidated"] = True
 
     if len(G.edges) == 0 or not reconnect_edges:
-        # if reconnect_edges is False or there are no edges in original graph
-        # (after dead-end removed), then skip edges and return new graph as-is
         return Gc
 
-    # STEPS 6+7
-    # create edges between clusters and extend geometries to new node points
-    gdf_edges = convert.graph_to_gdfs(G, nodes=False)
-    _reconnect_edges_to_clusters(Gc, gdf, G, gdf_edges)
+    # STEPS 6+7: cluster-to-cluster edges + geometry extension
+    _reconnect_edges_to_clusters(Gc, cluster_df, G)
 
-    # calculate street_count attribute for all nodes lacking it
+    # recompute street_count for nodes that lack it
     null_nodes = [n for n, sc in Gc.nodes(data="street_count") if sc is None]
     street_counts = stats.count_streets_per_node(Gc, nodes=null_nodes)
     nx.set_node_attributes(Gc, street_counts, name="street_count")
