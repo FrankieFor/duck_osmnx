@@ -13,7 +13,8 @@ from typing import overload
 
 import networkx as nx
 import numpy as np
-import pandas as pd
+import pyarrow as pa
+import shapely
 
 from . import bearing
 from . import convert
@@ -23,7 +24,7 @@ from . import utils
 from . import utils_geo
 
 if TYPE_CHECKING:
-    import geopandas as gpd
+    pass
 
 # matplotlib is an optional dependency needed for visualization
 try:
@@ -89,7 +90,7 @@ def get_node_colors_by_attr(
     stop: float = 1,
     na_color: str = "none",
     equal_size: bool = False,
-) -> pd.Series:  # type: ignore[type-arg,unused-ignore]  # needed for python<=3.9
+) -> dict[Any, str]:
     """
     Return colors based on nodes' numerical attribute values.
 
@@ -100,26 +101,24 @@ def get_node_colors_by_attr(
     attr
         Name of a node attribute with numerical values.
     num_bins
-        If None, linearly map a color to each value. Otherwise, assign values
-        to this many bins then assign a color to each bin.
+        If None, linearly map a color to each value. Otherwise, bin values
+        into ``num_bins`` and assign one color per bin.
     cmap
-        Name of the matplotlib colormap from which to choose the colors.
-    start
-        Where to start in the colorspace (from 0 to 1).
-    stop
-        Where to end in the colorspace (from 0 to 1).
+        Matplotlib colormap name.
+    start, stop
+        Where to start/stop in the colorspace (each in ``[0, 1]``).
     na_color
-        The color to assign to nodes with missing `attr` values.
+        Color for nodes missing ``attr``.
     equal_size
-        Ignored if `num_bins` is None. If True, bin into equal-sized quantiles
-        (requires unique bin edges). If False, bin into equal-spaced bins.
+        If True (and ``num_bins`` is set), use equal-frequency quantile
+        bins; if False, equal-width bins.
 
     Returns
     -------
     node_colors
-        Labels are node IDs, values are colors as hex strings.
+        Mapping ``{node_id: color_hex_string}``.
     """
-    vals = pd.Series(nx.get_node_attributes(G, attr))
+    vals = nx.get_node_attributes(G, attr)
     return _get_colors_by_value(vals, num_bins, cmap, start, stop, na_color, equal_size)
 
 
@@ -133,7 +132,7 @@ def get_edge_colors_by_attr(
     stop: float = 1,
     na_color: str = "none",
     equal_size: bool = False,
-) -> pd.Series:  # type: ignore[type-arg,unused-ignore]  # needed for python<=3.9
+) -> dict[Any, str]:
     """
     Return colors based on edges' numerical attribute values.
 
@@ -142,28 +141,26 @@ def get_edge_colors_by_attr(
     G
         Input graph.
     attr
-        Name of a node attribute with numerical values.
+        Edge attribute name with numerical values.
     num_bins
-        If None, linearly map a color to each value. Otherwise, assign values
-        to this many bins then assign a color to each bin.
+        If None, linearly map a color to each value. Otherwise, bin values
+        into ``num_bins`` and assign one color per bin.
     cmap
-        Name of the matplotlib colormap from which to choose the colors.
-    start
-        Where to start in the colorspace (from 0 to 1).
-    stop
-        Where to end in the colorspace (from 0 to 1).
+        Matplotlib colormap name.
+    start, stop
+        Where to start/stop in the colorspace (each in ``[0, 1]``).
     na_color
-        The color to assign to nodes with missing `attr` values.
+        Color for edges missing ``attr``.
     equal_size
-        Ignored if `num_bins` is None. If True, bin into equal-sized quantiles
-        (requires unique bin edges). If False, bin into equal-spaced bins.
+        If True (and ``num_bins`` is set), use equal-frequency quantile
+        bins; if False, equal-width bins.
 
     Returns
     -------
     edge_colors
-        Labels are `(u, v, k)` edge IDs, values are colors as hex strings.
+        Mapping ``{(u, v, k): color_hex_string}``.
     """
-    vals = pd.Series(nx.get_edge_attributes(G, attr))
+    vals = nx.get_edge_attributes(G, attr)
     return _get_colors_by_value(vals, num_bins, cmap, start, stop, na_color, equal_size)
 
 
@@ -252,33 +249,57 @@ def plot_graph(  # noqa: PLR0913
     utils.log(msg, level=lg.INFO)
     fig, ax = _get_fig_ax(ax=ax, figsize=figsize, bgcolor=bgcolor, polar=False)
 
+    edge_segments: list[np.ndarray] | None = None
+    node_xs: np.ndarray | None = None
+    node_ys: np.ndarray | None = None
+
     if max_edge_lw > 0:
-        # plot the edges' geometries
-        gdf_edges = convert.graph_to_gdfs(G, nodes=False)["geometry"]
-        ax = gdf_edges.plot(ax=ax, color=edge_color, lw=edge_linewidth, alpha=edge_alpha, zorder=1)
+        # build per-edge coordinate sequences directly from G; matplotlib's
+        # LineCollection draws them without ever materializing a GeoDataFrame
+        from matplotlib.collections import LineCollection  # noqa: PLC0415
+
+        edge_segments = []
+        node_xy = {n: (G.nodes[n]["x"], G.nodes[n]["y"]) for n in G.nodes}
+        # honor an explicit edge geometry attribute when present
+        for u, v, data in G.edges(data=True):
+            geom = data.get("geometry")
+            if geom is not None and hasattr(geom, "coords"):
+                edge_segments.append(np.asarray(geom.coords, dtype=np.float64))
+            else:
+                edge_segments.append(np.asarray([node_xy[u], node_xy[v]], dtype=np.float64))
+        lc = LineCollection(
+            edge_segments, colors=edge_color, linewidths=edge_linewidth,
+            alpha=edge_alpha, zorder=1,
+        )
+        ax.add_collection(lc)
 
     if max_node_size > 0:
-        # scatter plot the nodes' x/y coordinates
-        gdf_nodes = convert.graph_to_gdfs(G, edges=False, node_geometry=False)[["x", "y"]]
+        node_xs = np.fromiter((G.nodes[n]["x"] for n in G.nodes), dtype=np.float64,
+                              count=len(G.nodes))
+        node_ys = np.fromiter((G.nodes[n]["y"] for n in G.nodes), dtype=np.float64,
+                              count=len(G.nodes))
+        # accept dict-keyed node_color from get_node_colors_by_attr by aligning
+        # to G.nodes order
+        if isinstance(node_color, dict):
+            node_color = [node_color.get(n, "none") for n in G.nodes]
         ax.scatter(
-            x=gdf_nodes["x"],
-            y=gdf_nodes["y"],
-            s=node_size,
-            c=node_color,
-            alpha=node_alpha,
-            edgecolor=node_edgecolor,
-            zorder=node_zorder,
+            x=node_xs, y=node_ys, s=node_size, c=node_color,
+            alpha=node_alpha, edgecolor=node_edgecolor, zorder=node_zorder,
         )
 
-    # get spatial extents from bbox parameter or the edges' geometries
+    # determine spatial extents
     padding = 0.0
     if bbox is None:
-        try:
-            left, bottom, right, top = gdf_edges.total_bounds
-        except NameError:
-            left, bottom = gdf_nodes.min()
-            right, top = gdf_nodes.max()
-        bbox = left, bottom, right, top
+        if edge_segments is not None and edge_segments:
+            stacked = np.concatenate(edge_segments, axis=0)
+            left, bottom = stacked.min(axis=0)
+            right, top = stacked.max(axis=0)
+        elif node_xs is not None and node_ys is not None:
+            left, bottom = float(node_xs.min()), float(node_ys.min())
+            right, top = float(node_xs.max()), float(node_ys.max())
+        else:  # pragma: no cover
+            left, bottom, right, top = 0.0, 0.0, 0.0, 0.0
+        bbox = float(left), float(bottom), float(right), float(top)
         padding = 0.02  # pad 2% to not cut off peripheral nodes' circles
 
     # configure axes appearance, save/show figure as specified, and return
@@ -556,10 +577,14 @@ def plot_figure_ground(
     # assign the node size to each node in the graph
     node_sizes: list[float] | float = [node_widths[node] for node in Gu.nodes]
 
-    # define the view extents of the plotting figure
-    node_geoms = convert.graph_to_gdfs(Gu, edges=False, node_geometry=True).union_all()
-    lonlat_point = node_geoms.centroid.coords[0]
-    latlon_point = tuple(reversed(lonlat_point))
+    # define the view extents from the centroid of all node points
+    node_xs = np.fromiter((Gu.nodes[n]["x"] for n in Gu.nodes), dtype=np.float64,
+                          count=len(Gu.nodes))
+    node_ys = np.fromiter((Gu.nodes[n]["y"] for n in Gu.nodes), dtype=np.float64,
+                          count=len(Gu.nodes))
+    node_pts = shapely.points(node_xs, node_ys)
+    centroid = shapely.union_all(node_pts).centroid
+    latlon_point = (centroid.y, centroid.x)
     bbox = utils_geo.bbox_from_point(latlon_point, dist=dist, project_utm=False)
 
     # plot the figure
@@ -578,7 +603,7 @@ def plot_figure_ground(
 
 
 def plot_footprints(  # noqa: PLR0913
-    gdf: gpd.GeoDataFrame,
+    table: pa.Table,
     *,
     ax: Axes | None = None,
     figsize: tuple[float, float] = (8, 8),
@@ -595,12 +620,13 @@ def plot_footprints(  # noqa: PLR0913
     dpi: int = 600,
 ) -> tuple[Figure, Axes]:
     """
-    Visualize a GeoDataFrame of geospatial features' footprints.
+    Visualize an Arrow table of geospatial features' footprints.
 
     Parameters
     ----------
-    gdf
-        GeoDataFrame of footprints (i.e., Polygons and/or MultiPolygons).
+    table
+        Arrow table with a ``geometry`` column (geoarrow.wkb).
+        Non-Polygon/MultiPolygon rows are ignored.
     ax
         If not None, plot on this pre-existing axes instance.
     figsize
@@ -636,24 +662,64 @@ def plot_footprints(  # noqa: PLR0913
         The resulting matplotlib figure and axes objects.
     """
     _verify_mpl()
+    from matplotlib.collections import PatchCollection  # noqa: PLC0415
+    from matplotlib.patches import PathPatch  # noqa: PLC0415
+    from matplotlib.path import Path as MplPath  # noqa: PLC0415
+
     fig, ax = _get_fig_ax(ax=ax, figsize=figsize, bgcolor=bgcolor, polar=False)
 
-    # retain only Polygons and MultiPolygons, then plot
-    gdf = gdf[gdf["geometry"].type.isin({"Polygon", "MultiPolygon"})]
-    ax = gdf.plot(
-        ax=ax,
-        facecolor=color,
-        edgecolor=edge_color,
-        linewidth=edge_linewidth,
-        alpha=alpha,
+    # decode WKB → shapely, retain only Polygon / MultiPolygon
+    wkb_col = table.column("geometry").to_pylist()
+    geoms = shapely.from_wkb(wkb_col)
+    keep_types = {"Polygon", "MultiPolygon"}
+    geoms = [g for g in geoms if g is not None and g.geom_type in keep_types]
+    if not geoms:  # pragma: no cover
+        msg = "No Polygon/MultiPolygon geometries to plot."
+        raise ValueError(msg)
+
+    patches: list[PathPatch] = []
+    minx = miny = float("inf")
+    maxx = maxy = float("-inf")
+    for geom in geoms:
+        polys = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
+        for poly in polys:
+            ext = np.asarray(poly.exterior.coords, dtype=np.float64)
+            verts = [ext]
+            codes = [
+                np.concatenate(([MplPath.MOVETO], np.full(len(ext) - 1, MplPath.LINETO))),
+            ]
+            for ring in poly.interiors:
+                hole = np.asarray(ring.coords, dtype=np.float64)
+                verts.append(hole)
+                codes.append(
+                    np.concatenate(([MplPath.MOVETO], np.full(len(hole) - 1, MplPath.LINETO))),
+                )
+            path = MplPath(np.concatenate(verts), np.concatenate(codes))
+            patches.append(PathPatch(path))
+            bx, by, bX, bY = poly.bounds
+            minx, miny = min(minx, bx), min(miny, by)
+            maxx, maxy = max(maxx, bX), max(maxy, bY)
+
+    coll = PatchCollection(
+        patches, facecolor=color, edgecolor=edge_color,
+        linewidth=edge_linewidth, alpha=alpha,
     )
+    ax.add_collection(coll)
 
-    # determine figure extents
     if bbox is None:
-        bbox = tuple(gdf.total_bounds)
+        bbox = (minx, miny, maxx, maxy)
 
-    # configure axes appearance, save/show figure as specified, and return
-    ax = _config_ax(ax, gdf.crs, bbox, 0)
+    # recover CRS from the geometry field metadata
+    geom_meta = table.schema.field("geometry").metadata or {}
+    ext_meta = geom_meta.get(b"ARROW:extension:metadata", b"")
+    crs = None
+    if b'"crs":"' in ext_meta:
+        s = ext_meta.find(b'"crs":"') + len(b'"crs":"')
+        e = ext_meta.find(b'"', s)
+        crs_token = ext_meta[s:e].decode("ascii")
+        crs = crs_token if crs_token else None
+
+    ax = _config_ax(ax, crs, bbox, 0)
     fig, ax = _save_and_show(
         fig=fig,
         ax=ax,
@@ -808,40 +874,39 @@ def plot_orientation(  # noqa: PLR0913
 
 
 def _get_colors_by_value(
-    vals: pd.Series,  # type: ignore[type-arg,unused-ignore]  # needed for python<=3.9
+    vals: dict[Any, Any],
     num_bins: int | None,
     cmap: str,
     start: float,
     stop: float,
     na_color: str,
     equal_size: bool,  # noqa: FBT001
-) -> pd.Series:  # type: ignore[type-arg,unused-ignore]  # needed for python<=3.9
+) -> dict[Any, str]:
     """
-    Map colors to the values in a Series of node/edge attribute values.
+    Map colors to the entries of a ``{id: value}`` dict.
 
     Parameters
     ----------
     vals
-        Series labels are node/edge IDs and values are attribute values.
+        Mapping from node/edge ID to numeric attribute value (or ``None``
+        / ``NaN`` for missing).
     num_bins
-        If None, linearly map a color to each value. Otherwise, assign values
-        to this many bins then assign a color to each bin.
+        If None, linearly map a color across the value range. Otherwise,
+        bin values into ``num_bins`` and assign one color per bin.
     cmap
-        Name of the matplotlib colormap from which to choose the colors.
-    start
-        Where to start in the colorspace (from 0 to 1).
-    stop
-        Where to end in the colorspace (from 0 to 1).
+        Matplotlib colormap name.
+    start, stop
+        Colorspace start/stop in ``[0, 1]``.
     na_color
-        The color to assign to nodes with missing `attr` values.
+        Color for entries with null/NaN values.
     equal_size
-        Ignored if `num_bins` is None. If True, bin into equal-sized quantiles
-        (requires unique bin edges). If False, bin into equal-spaced bins.
+        Ignored when ``num_bins`` is None; otherwise True → equal-frequency
+        quantile bins, False → equal-width bins.
 
     Returns
     -------
-    color_series
-        Labels are node/edge IDs, values are colors as hex strings.
+    color_map
+        Mapping ``{id: color_hex_string}``.
     """
     _verify_mpl()
 
@@ -849,31 +914,55 @@ def _get_colors_by_value(
         msg = "There are no attribute values."
         raise ValueError(msg)
 
+    keys = list(vals.keys())
+    raw = np.array([vals[k] for k in keys], dtype=object)
+    # null mask for missing/NaN values
+    null_mask = np.array([
+        v is None or (isinstance(v, float) and np.isnan(v))
+        for v in raw
+    ])
+
+    if null_mask.all():
+        return dict.fromkeys(keys, na_color)
+
+    numeric = np.array(
+        [np.nan if null_mask[i] else float(raw[i]) for i in range(len(raw))],
+        dtype=np.float64,
+    )
+
     if num_bins is None:
-        # calculate min/max values based on start/stop and data range
-        vals_min = vals.dropna().min()
-        vals_max = vals.dropna().max()
-        full_range = (vals_max - vals_min) / (stop - start)
+        valid = numeric[~null_mask]
+        vals_min = float(valid.min())
+        vals_max = float(valid.max())
+        full_range = (vals_max - vals_min) / (stop - start) if stop != start else 1.0
         full_min = vals_min - full_range * start
         full_max = full_min + full_range
 
-        # linearly map a color to each attribute value
         normalizer = colors.Normalize(full_min, full_max)
         scalar_mapper = cm.ScalarMappable(normalizer, colormaps[cmap])
-        color_series = vals.map(scalar_mapper.to_rgba).map(colors.to_hex)  # type: ignore[arg-type,unused-ignore]  # needed for python<=3.9
-        color_series.loc[pd.isna(vals)] = na_color
+        out: dict[Any, str] = {}
+        for i, key in enumerate(keys):
+            if null_mask[i]:
+                out[key] = na_color
+            else:
+                out[key] = colors.to_hex(scalar_mapper.to_rgba(numeric[i]))
+        return out
 
+    # binned mode
+    valid_vals = numeric[~null_mask]
+    if equal_size:
+        # equal-frequency quantile edges
+        edges = np.quantile(valid_vals, np.linspace(0, 1, num_bins + 1))
     else:
-        # otherwise, bin values then assign colors to bins
-        if equal_size:
-            bins = pd.qcut(vals, num_bins, labels=range(num_bins))
-        else:
-            bins = pd.cut(vals, num_bins, labels=range(num_bins))
-        bin_colors = get_colors(num_bins, cmap=cmap, start=start, stop=stop)
-        color_list = [bin_colors[b] if pd.notna(b) else na_color for b in bins]
-        color_series = pd.Series(color_list, index=bins.index)
-
-    return color_series
+        edges = np.linspace(valid_vals.min(), valid_vals.max(), num_bins + 1)
+    # np.digitize returns 1..num_bins for in-range values, 0/num_bins+1 for out-of-range
+    bin_ids = np.digitize(numeric, edges[1:-1], right=False)
+    bin_ids = np.clip(bin_ids, 0, num_bins - 1)
+    bin_colors = get_colors(num_bins, cmap=cmap, start=start, stop=stop)
+    return {
+        key: na_color if null_mask[i] else bin_colors[int(bin_ids[i])]
+        for i, key in enumerate(keys)
+    }
 
 
 def _save_and_show(
