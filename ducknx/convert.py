@@ -566,6 +566,37 @@ def _update_edge_keys(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
     return G
 
 
+def _coerce_mixed_scalar_list(rows: list[dict[str, Any]]) -> None:
+    """
+    Promote scalar values to single-element lists for mixed scalar/list keys.
+
+    NetworkX simplified graphs can produce attributes whose value is a scalar
+    on some edges and a list on others (e.g. ``osmid``). Polars rejects this
+    mix when inferring a column type. We unify them to ``list`` semantics in
+    place so downstream Arrow conversion succeeds.
+
+    Parameters
+    ----------
+    rows
+        List of attribute dicts; mutated in place.
+    """
+    seen_list: set[str] = set()
+    seen_scalar: set[str] = set()
+    for row in rows:
+        for key, val in row.items():
+            if isinstance(val, list):
+                seen_list.add(key)
+            elif val is not None:
+                seen_scalar.add(key)
+    mixed = seen_list & seen_scalar
+    if not mixed:
+        return
+    for row in rows:
+        for key in mixed:
+            if key in row and not isinstance(row[key], list) and row[key] is not None:
+                row[key] = [row[key]]
+
+
 def _wkb_field(name: str, crs: str | None) -> pa.Field:
     """
     Build a PyArrow field with geoarrow.wkb extension type metadata.
@@ -738,7 +769,8 @@ def graph_to_arrow(
             raise ValueError(msg)
 
         node_rows = [{"osmid": n, **data} for n, data in G.nodes(data=True)]
-        nodes_df = pl.DataFrame(node_rows, infer_schema_length=None)
+        _coerce_mixed_scalar_list(node_rows)
+        nodes_df = pl.DataFrame(node_rows, infer_schema_length=None, strict=False)
 
         if node_geometry:
             xs = nodes_df.get_column("x").to_numpy()
@@ -766,7 +798,8 @@ def graph_to_arrow(
             row["geometry"] = shapely.to_wkb(geom) if geom is not None else None
             edge_rows.append(row)
 
-        edges_df = pl.DataFrame(edge_rows, infer_schema_length=None)
+        _coerce_mixed_scalar_list(edge_rows)
+        edges_df = pl.DataFrame(edge_rows, infer_schema_length=None, strict=False)
         edges_tbl = edges_df.to_arrow()
         edges_tbl = _attach_geoarrow(edges_tbl, "geometry", crs)
         utils.log("Created edges Arrow table from graph", level=lg.INFO)
