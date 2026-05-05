@@ -241,7 +241,9 @@ def features_from_place(
     table
         Arrow table of OSM features.
     """
-    polygon = geocoder.geocode_to_gdf(query, which_result=which_result).union_all()
+    place_tbl = geocoder.geocode_to_arrow(query, which_result=which_result)
+    geoms = shapely.from_wkb(place_tbl.column("geometry").to_pylist())
+    polygon = shapely.union_all(geoms)
     utils.log("Constructed place geometry polygon(s) to query", level=lg.INFO)
     return features_from_polygon(polygon, tags)
 

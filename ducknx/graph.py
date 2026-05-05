@@ -16,6 +16,7 @@ from typing import Any
 import networkx as nx
 import polars as pl
 import pyarrow as pa
+import shapely
 from shapely import MultiPolygon
 from shapely import Polygon
 
@@ -387,8 +388,10 @@ def graph_from_place(
     function to automatically make multiple requests: see that function's
     documentation for caveats.
     """
-    # extract the geometry from the GeoDataFrame to use in query
-    polygon = geocoder.geocode_to_gdf(query, which_result=which_result).union_all()
+    # extract the geometry from the Arrow table to use in query
+    place_tbl = geocoder.geocode_to_arrow(query, which_result=which_result)
+    geoms = shapely.from_wkb(place_tbl.column("geometry").to_pylist())
+    polygon = shapely.union_all(geoms)
     msg = "Constructed place geometry polygon(s) to query"
     utils.log(msg, level=lg.INFO)
 

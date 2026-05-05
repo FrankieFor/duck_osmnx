@@ -24,7 +24,7 @@ from .features import features_from_place as features_from_place
 from .features import features_from_point as features_from_point
 from .features import features_from_polygon as features_from_polygon
 from .geocoder import geocode as geocode
-from .geocoder import geocode_to_gdf as geocode_to_gdf
+from .geocoder import geocode_to_arrow as geocode_to_arrow
 from .graph import graph_from_address as graph_from_address
 from .graph import graph_from_bbox as graph_from_bbox
 from .graph import graph_from_place as graph_from_place
