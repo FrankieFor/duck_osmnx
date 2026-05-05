@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import itertools
 import logging as lg
+import math
 import multiprocessing as mp
 import re
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
 from typing import overload
 from warnings import warn
 
 import networkx as nx
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from . import convert
 from . import utils
@@ -535,61 +536,77 @@ def add_edge_speeds(
         Graph with `speed_kph` attributes on all edges.
     """
     if fallback is None:
-        fallback = np.nan
+        fallback = float("nan")
 
-    edges = convert.graph_to_gdfs(G, nodes=False, fill_edge_geometry=False)
+    # build aligned per-edge arrays directly from G; no gdf round-trip
+    uvk: list[tuple[Any, Any, Any]] = []
+    highways: list[str | None] = []
+    raw_maxspeeds: list[Any] = []
+    for u, v, k, data in G.edges(keys=True, data=True):
+        uvk.append((u, v, k))
+        hwy = data.get("highway")
+        if isinstance(hwy, list):
+            hwy = hwy[0] if hwy else None
+        highways.append(hwy)
+        raw_maxspeeds.append(data.get("maxspeed"))
 
-    # collapse any highway lists (can happen during graph simplification)
-    # into string values simply by keeping just the first element of the list
-    edges["highway"] = edges["highway"].map(lambda x: x[0] if isinstance(x, list) else x)
+    # collapse list-typed maxspeeds and clean numeric/mph strings
+    speed_kph: list[float | None] = []
+    for raw in raw_maxspeeds:
+        collapsed = _collapse_multiple_maxspeed_values(raw, agg=agg)
+        if collapsed is None or (isinstance(collapsed, float) and math.isnan(collapsed)):
+            speed_kph.append(None)
+        elif isinstance(collapsed, str):
+            speed_kph.append(_clean_maxspeed(collapsed))
+        else:
+            speed_kph.append(float(collapsed))
 
-    if "maxspeed" in edges.columns:
-        # collapse any maxspeed lists (can happen during graph simplification)
-        # into a single value
-        edges["maxspeed"] = edges["maxspeed"].apply(_collapse_multiple_maxspeed_values, agg=agg)
-
-        # create speed_kph by cleaning maxspeed strings and converting mph to
-        # kph if necessary
-        edges["speed_kph"] = edges["maxspeed"].astype(str).map(_clean_maxspeed).astype(float)
-    else:
-        # if no edges in graph had a maxspeed attribute
-        edges["speed_kph"] = None
-
-    # if user provided hwy_speeds, use them as default values, otherwise
-    # initialize an empty series to populate with values
-    hwy_speed_avg = pd.Series(dtype=float) if hwy_speeds is None else pd.Series(hwy_speeds).dropna()
-
-    # for each highway type that caller did not provide in hwy_speeds, impute
-    # speed of type by taking the mean of the preexisting speed values of that
-    # highway type
-    for hwy, group in edges.groupby("highway"):
-        if hwy not in hwy_speed_avg:
-            hwy_speed_avg.loc[hwy] = agg(group["speed_kph"])
-
-    # if any highway types had no preexisting speed values, impute their speed
-    # with fallback value provided by caller. if fallback=np.nan, impute speed
-    # as the mean speed of all highway types that did have preexisting values
-    hwy_speed_avg = hwy_speed_avg.fillna(fallback).fillna(agg(hwy_speed_avg))
-
-    # for each edge missing speed data, assign it the imputed value for its
-    # highway type
-    speed_kph = (
-        edges[["highway", "speed_kph"]].set_index("highway").iloc[:, 0].fillna(hwy_speed_avg)
+    # per-highway imputation: mean of observed speeds, with hwy_speeds
+    # overrides taking precedence, and fallback applying to remaining gaps
+    df = pl.DataFrame({"highway": highways, "speed_kph": speed_kph})
+    observed = (
+        df.lazy()
+        .filter(pl.col("speed_kph").is_not_null())
+        .group_by("highway").agg(pl.col("speed_kph").mean().alias("avg"))
+        .collect()
     )
+    hwy_avg: dict[Any, float] = dict(zip(
+        observed.get_column("highway").to_list(),
+        observed.get_column("avg").to_list(),
+        strict=True,
+    ))
+    if hwy_speeds:
+        for k, v in hwy_speeds.items():
+            if v is not None and not (isinstance(v, float) and math.isnan(v)):
+                hwy_avg[k] = float(v)
 
-    # all speeds will be null if edges had no preexisting maxspeed data and
-    # caller did not pass in hwy_speeds or fallback arguments
-    if pd.isna(speed_kph).all():
+    # fallback for highway types missing entirely
+    valid_avgs = [v for v in hwy_avg.values()
+                  if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    overall_default = float(agg(valid_avgs)) if valid_avgs else float("nan")
+    fallback_value = float(fallback) if not (isinstance(fallback, float)
+                                              and math.isnan(fallback)) else overall_default
+
+    # final per-edge speed: keep edge value if present, else hwy mean, else fallback
+    final_speed: list[float] = []
+    for hwy, sp in zip(highways, speed_kph, strict=True):
+        if sp is not None and not (isinstance(sp, float) and math.isnan(sp)):
+            final_speed.append(float(sp))
+        elif hwy in hwy_avg and hwy_avg[hwy] is not None and \
+                not (isinstance(hwy_avg[hwy], float) and math.isnan(hwy_avg[hwy])):
+            final_speed.append(float(hwy_avg[hwy]))
+        else:
+            final_speed.append(fallback_value)
+
+    if all(math.isnan(s) for s in final_speed):
         msg = (
             "This graph's edges have no preexisting 'maxspeed' attribute "
             "values so you must pass `hwy_speeds` or `fallback` arguments."
         )
         raise ValueError(msg)
 
-    # add speed kph attribute to graph edges
-    edges["speed_kph"] = speed_kph.to_numpy()
-    nx.set_edge_attributes(G, values=edges["speed_kph"], name="speed_kph")
-
+    nx.set_edge_attributes(G, values=dict(zip(uvk, final_speed, strict=True)),
+                           name="speed_kph")
     return G
 
 
@@ -612,29 +629,31 @@ def add_edge_travel_times(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
     G
         Graph with `travel_time` attributes on all edges.
     """
-    edges = convert.graph_to_gdfs(G, nodes=False)
+    uvk: list[tuple[Any, Any, Any]] = []
+    lengths: list[float] = []
+    speeds: list[float] = []
+    for u, v, k, data in G.edges(keys=True, data=True):
+        if "length" not in data or "speed_kph" not in data:  # pragma: no cover
+            msg = "All edges must have 'length' and 'speed_kph' attributes."
+            raise KeyError(msg)
+        length_val = data["length"]
+        speed_val = data["speed_kph"]
+        if length_val is None or speed_val is None or \
+                (isinstance(length_val, float) and math.isnan(length_val)) or \
+                (isinstance(speed_val, float) and math.isnan(speed_val)):  # pragma: no cover
+            msg = "Edge 'length' and 'speed_kph' values must be non-null."
+            raise ValueError(msg)
+        uvk.append((u, v, k))
+        lengths.append(float(length_val))
+        speeds.append(float(speed_val))
 
-    # verify edge length and speed_kph attributes exist
-    if not ("length" in edges.columns and "speed_kph" in edges.columns):  # pragma: no cover
-        msg = "All edges must have 'length' and 'speed_kph' attributes."
-        raise KeyError(msg)
-
-    # verify edge length and speed_kph attributes contain no nulls
-    if pd.isna(edges["length"]).any() or pd.isna(edges["speed_kph"]).any():  # pragma: no cover
-        msg = "Edge 'length' and 'speed_kph' values must be non-null."
-        raise ValueError(msg)
-
-    # convert distance meters to km, and speed km per hour to km per second
-    distance_km = edges["length"] / 1000
-    speed_km_sec = edges["speed_kph"] / (60 * 60)
-
-    # calculate edge travel time in seconds
+    # convert distance meters to km, and speed km/h to km/s
+    distance_km = np.asarray(lengths) / 1000.0
+    speed_km_sec = np.asarray(speeds) / (60 * 60)
     travel_time = distance_km / speed_km_sec
 
-    # add travel time attribute to graph edges
-    edges["travel_time"] = travel_time.to_numpy()
-    nx.set_edge_attributes(G, values=edges["travel_time"], name="travel_time")
-
+    nx.set_edge_attributes(G, values=dict(zip(uvk, travel_time, strict=True)),
+                           name="travel_time")
     return G
 
 
@@ -724,11 +743,14 @@ def _collapse_multiple_maxspeed_values(
     try:
         # clean/convert each value in list as needed then aggregate
         values = [_clean_maxspeed(x) for x in value]
-        collapsed: float | None = float(agg(pd.Series(values).dropna()))
+        cleaned = [v for v in values if v is not None
+                   and not (isinstance(v, float) and math.isnan(v))]
+        if not cleaned:
+            return None
+        collapsed = float(agg(cleaned))
     except ValueError:
         return None
     else:
-        # return that single aggregated value if it's non-null, otherwise None
-        if not pd.isna(collapsed):
-            return collapsed
-        return None
+        if math.isnan(collapsed):
+            return None
+        return collapsed

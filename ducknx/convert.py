@@ -7,331 +7,16 @@ import logging as lg
 from typing import Any
 from typing import Literal
 from typing import overload
-from warnings import warn
 
-import geopandas as gpd
 import networkx as nx
-import pandas as pd
+import polars as pl
+import pyarrow as pa
+import shapely
 from shapely import LineString
-from shapely import Point
 
 from . import utils
 
 
-# nodes and edges are both missing (therefore both default true)
-@overload
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]: ...
-
-
-# both present/True
-@overload
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    nodes: Literal[True],
-    edges: Literal[True],
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]: ...
-
-
-# both present, nodes true, edges false
-@overload
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    nodes: Literal[True],
-    edges: Literal[False],
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> gpd.GeoDataFrame: ...
-
-
-# both present, nodes false, edges true
-@overload
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    nodes: Literal[False],
-    edges: Literal[True],
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> gpd.GeoDataFrame: ...
-
-
-# nodes missing (therefore default true), edges present/true
-@overload
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    edges: Literal[True],
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]: ...
-
-
-# nodes missing (therefore default true), edges present/false
-@overload
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    edges: Literal[False],
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> gpd.GeoDataFrame: ...
-
-
-# nodes present/true, edges missing (therefore default true)
-@overload
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    nodes: Literal[True],
-    edges: bool = True,
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]: ...
-
-
-# nodes present/false, edges missing (therefore default true)
-@overload
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    nodes: Literal[False],
-    edges: bool = True,
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> gpd.GeoDataFrame: ...
-
-
-def graph_to_gdfs(
-    G: nx.MultiGraph | nx.MultiDiGraph,
-    *,
-    nodes: bool = True,
-    edges: bool = True,
-    node_geometry: bool = True,
-    fill_edge_geometry: bool = True,
-) -> gpd.GeoDataFrame | tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """
-    Convert a MultiGraph or MultiDiGraph to node and/or edge GeoDataFrames.
-
-    This function is the inverse of `graph_from_gdfs`.
-
-    Parameters
-    ----------
-    G
-        Input graph.
-    nodes
-        If True, convert graph nodes to a GeoDataFrame and return it.
-    edges
-        If True, convert graph edges to a GeoDataFrame and return it.
-    node_geometry
-        If True, create a geometry column from node "x" and "y" attributes.
-    fill_edge_geometry
-        If True, fill missing edge geometry fields using endpoint nodes'
-        coordinates to create a LineString.
-
-    Returns
-    -------
-    gdf_nodes or gdf_edges or (gdf_nodes, gdf_edges)
-        `gdf_nodes` is indexed by `osmid` and `gdf_edges` is multi-indexed by
-        `(u, v, key)` following normal MultiGraph/MultiDiGraph structure.
-    """
-    crs = G.graph["crs"]
-
-    if nodes:
-        if len(G.nodes) == 0:  # pragma: no cover
-            msg = "Graph contains no nodes."
-            raise ValueError(msg)
-
-        uvk, data = zip(*G.nodes(data=True))
-
-        if node_geometry:
-            # convert node x/y attributes to Points for geometry column
-            node_geoms = (Point(d["x"], d["y"]) for d in data)
-            gdf_nodes = gpd.GeoDataFrame(data, index=uvk, crs=crs, geometry=list(node_geoms))
-        else:
-            gdf_nodes = gpd.GeoDataFrame(data, index=uvk)
-
-        gdf_nodes.index = gdf_nodes.index.rename("osmid")
-        msg = "Created nodes GeoDataFrame from graph"
-        utils.log(msg, level=lg.INFO)
-
-    if edges:
-        if len(G.edges) == 0:  # pragma: no cover
-            msg = "Graph contains no edges."
-            raise ValueError(msg)
-
-        u, v, k, data = zip(*G.edges(keys=True, data=True))
-
-        if fill_edge_geometry:
-            node_coords = {n: (G.nodes[n]["x"], G.nodes[n]["y"]) for n in G}
-            edge_geoms = (
-                d.get("geometry", LineString((node_coords[u], node_coords[v])))
-                for u, v, _, d in G.edges(keys=True, data=True)
-            )
-            gdf_edges = gpd.GeoDataFrame(data, crs=crs, geometry=list(edge_geoms))
-
-        else:
-            gdf_edges = gpd.GeoDataFrame(data)
-            if "geometry" not in gdf_edges.columns:
-                # if no edges have a geometry attribute, create null column
-                gdf_edges = gdf_edges.set_geometry([None] * len(gdf_edges))
-            gdf_edges = gdf_edges.set_crs(crs)
-
-        # add u, v, key attributes as index
-        gdf_edges["u"] = u
-        gdf_edges["v"] = v
-        gdf_edges["key"] = k
-        gdf_edges = gdf_edges.set_index(["u", "v", "key"])
-
-        msg = "Created edges GeoDataFrame from graph"
-        utils.log(msg, level=lg.INFO)
-
-    if nodes and edges:
-        return gdf_nodes, gdf_edges
-
-    if nodes:
-        return gdf_nodes
-
-    if edges:
-        return gdf_edges
-
-    # otherwise
-    msg = "You must request nodes or edges or both."
-    raise ValueError(msg)
-
-
-def _validate_node_edge_gdfs(
-    gdf_nodes: gpd.GeoDataFrame,
-    gdf_edges: gpd.GeoDataFrame,
-) -> None:
-    """
-    Validate that node/edge GeoDataFrames can be converted to a MultiDiGraph.
-
-    Raises a `ValueError` if validation fails.
-
-    Parameters
-    ----------
-    gdf_nodes
-        GeoDataFrame of graph nodes uniquely indexed by `osmid`.
-    gdf_edges
-        GeoDataFrame of graph edges uniquely multi-indexed by `(u, v, key)`.
-    """
-    # ensure gdf_nodes contains x and y columns representing node geometries
-    if not ("x" in gdf_nodes.columns and "y" in gdf_nodes.columns):  # pragma: no cover
-        msg = "`gdf_nodes` must contain 'x' and 'y' columns."
-        raise ValueError(msg)
-
-    # ensure gdf_nodes and gdf_edges are uniquely indexed
-    if not (gdf_nodes.index.is_unique and gdf_edges.index.is_unique):  # pragma: no cover
-        msg = "`gdf_nodes` and `gdf_edges` must each be uniquely indexed."
-        raise ValueError(msg)
-
-    # ensure 1) gdf_edges are multi-indexed with 3 levels and 2) that its u
-    # and v values (first two index levels) all appear among gdf_nodes index
-    edges_index_levels = 3
-    check1 = gdf_edges.index.nlevels == edges_index_levels
-    uv = set(gdf_edges.index.get_level_values(0)) | set(gdf_edges.index.get_level_values(1))
-    check2 = uv.issubset(set(gdf_nodes.index))
-    if not (check1 and check2):  # pragma: no cover
-        msg = "`gdf_edges` must be multi-indexed by `(u, v, key)`."
-        raise ValueError(msg)
-
-    # warn user if geometry values differ from coordinates in x/y columns,
-    # because we discard the geometry column
-    if gdf_nodes.active_geometry_name is not None:  # pragma: no cover
-        msg = (
-            "Discarding the `gdf_nodes` 'geometry' column, though its values "
-            "differ from the coordinates in the 'x' and 'y' columns."
-        )
-        try:
-            all_x_match = (gdf_nodes.geometry.x == gdf_nodes["x"]).all()
-            all_y_match = (gdf_nodes.geometry.y == gdf_nodes["y"]).all()
-            if not (all_x_match and all_y_match):
-                # warn if x/y coords don't match geometry column
-                warn(msg, category=UserWarning, stacklevel=2)
-        except ValueError:  # pragma: no cover
-            # warn if geometry column contains non-point geometry types
-            warn(msg, category=UserWarning, stacklevel=2)
-
-
-def graph_from_gdfs(
-    gdf_nodes: gpd.GeoDataFrame,
-    gdf_edges: gpd.GeoDataFrame,
-    *,
-    graph_attrs: dict[str, Any] | None = None,
-) -> nx.MultiDiGraph:
-    """
-    Convert node and edge GeoDataFrames to a MultiDiGraph.
-
-    This function is the inverse of `graph_to_gdfs` and is designed to work in
-    conjunction with it. However, you can convert arbitrary node and edge
-    GeoDataFrames as long as 1) `gdf_nodes` is uniquely indexed by `osmid`, 2)
-    `gdf_nodes` contains `x` and `y` coordinate columns representing node
-    geometries, 3) `gdf_edges` is uniquely multi-indexed by `(u, v, key)`
-    (following normal MultiDiGraph structure). This allows you to load any
-    node/edge Shapefiles or GeoPackage layers as GeoDataFrames then convert
-    them to a MultiDiGraph for network analysis.
-
-    Note that any `geometry` attribute on `gdf_nodes` is discarded, since `x`
-    and `y` provide the necessary node geometry information instead.
-
-    Parameters
-    ----------
-    gdf_nodes
-        GeoDataFrame of graph nodes uniquely indexed by `osmid`.
-    gdf_edges
-        GeoDataFrame of graph edges uniquely multi-indexed by `(u, v, key)`.
-    graph_attrs
-        The new `G.graph` attribute dictionary. If None, use `gdf_edges`'s CRS
-        as the only graph-level attribute (`gdf_edges` must have its `crs`
-        attribute set).
-
-    Returns
-    -------
-    G
-        The converted MultiDiGraph.
-    """
-    _validate_node_edge_gdfs(gdf_nodes, gdf_edges)
-
-    # drop geometry column from gdf_nodes (since we use x and y for geometry
-    # information), but warn the user if the geometry values differ from the
-    # coordinates in the x and y columns. this results in a df instead of gdf.
-    if gdf_nodes.active_geometry_name is None:  # pragma: no cover
-        df_nodes = pd.DataFrame(gdf_nodes)
-    else:
-        df_nodes = gdf_nodes.drop(columns=gdf_nodes.active_geometry_name)
-
-    # create graph and add graph-level attribute dict
-    if graph_attrs is None:
-        graph_attrs = {"crs": gdf_edges.crs}
-    G = nx.MultiDiGraph(**graph_attrs)
-
-    # add edges and their attributes to graph, but filter out null attribute
-    # values so that edges only get attributes with non-null values
-    attr_names = gdf_edges.columns.to_list()
-    for (u, v, k), attr_vals in zip(gdf_edges.index, gdf_edges.to_numpy()):
-        data_all = zip(attr_names, attr_vals)
-        data = {name: val for name, val in data_all if isinstance(val, list) or pd.notna(val)}
-        G.add_edge(u, v, key=k, **data)
-
-    # add any nodes with no incident edges, since they wouldn't be added above
-    G.add_nodes_from(set(df_nodes.index) - set(G.nodes))
-
-    # now all nodes are added, so set nodes' attributes
-    for col in df_nodes.columns:
-        nx.set_node_attributes(G, name=col, values=df_nodes[col].dropna())
-
-    msg = "Created graph from node/edge GeoDataFrames"
-    utils.log(msg, level=lg.INFO)
-    return G
 
 
 def to_digraph(G: nx.MultiDiGraph, *, weight: str = "length") -> nx.DiGraph:
@@ -533,26 +218,26 @@ def _update_edge_keys(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
     G
         Graph with incremented keys where needed.
     """
-    # identify all the edges that are duplicates based on a sorted combination
-    # of their origin, destination, and key. that is, edge uv will match edge vu
-    # as a duplicate, but only if they have the same key
-    edges = graph_to_gdfs(G, nodes=False, fill_edge_geometry=False)
-    edges["uvk"] = ["_".join([*sorted([str(u), str(v)]), str(k)]) for u, v, k in edges.index]
-    mask = edges["uvk"].duplicated(keep=False)
-    dupes = edges[mask].dropna(subset=["geometry"])
+    # iterate G.edges directly: collect (u, v, k, geometry) and group on the
+    # canonical sorted-uv-and-key signature so directed pairs (u→v) and (v→u)
+    # with the same key collide as one group.
+    by_uvk: dict[str, list[tuple[Any, Any, Any, Any]]] = {}
+    for u, v, k, data in G.edges(keys=True, data=True):
+        geom = data.get("geometry")
+        if geom is None:
+            continue
+        canon = "_".join([*sorted([str(u), str(v)]), str(k)])
+        by_uvk.setdefault(canon, []).append((u, v, k, geom))
 
-    different_streets = []
-    groups = dupes[["geometry", "uvk"]].groupby("uvk")
-
-    # for each group of duplicate edges
-    for _, group in groups:
-        # for each pair of edges within this group
-        for geom1, geom2 in itertools.combinations(group["geometry"], 2):
-            # if they don't have the same geometry, flag them as different
-            # streets: flag edge uvk, but not edge vuk, otherwise we would
-            # increment both their keys and they'll still duplicate each other
+    different_streets: list[tuple[Any, Any, Any]] = []
+    for group in by_uvk.values():
+        if len(group) < 2:
+            continue
+        for (u1, v1, k1, geom1), (_u2, _v2, _k2, geom2) in itertools.combinations(group, 2):
             if not _is_same_geometry(geom1, geom2):
-                different_streets.append(group.index[0])
+                # flag the first edge in the group, mirroring the legacy semantics
+                different_streets.append((u1, v1, k1))
+                break
 
     # for each unique different street, increment its key to make it unique
     for u, v, k in set(different_streets):
@@ -560,6 +245,338 @@ def _update_edge_keys(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
         G.add_edge(u, v, key=new_key, **G.get_edge_data(u, v, k))
         G.remove_edge(u, v, key=k)
 
+    return G
+
+
+def _coerce_mixed_scalar_list(rows: list[dict[str, Any]]) -> None:
+    """
+    Promote scalar values to single-element lists for mixed scalar/list keys.
+
+    NetworkX simplified graphs can produce attributes whose value is a scalar
+    on some edges and a list on others (e.g. ``osmid``). Polars rejects this
+    mix when inferring a column type. We unify them to ``list`` semantics in
+    place so downstream Arrow conversion succeeds.
+
+    Parameters
+    ----------
+    rows
+        List of attribute dicts; mutated in place.
+    """
+    seen_list: set[str] = set()
+    seen_scalar: set[str] = set()
+    for row in rows:
+        for key, val in row.items():
+            if isinstance(val, list):
+                seen_list.add(key)
+            elif val is not None:
+                seen_scalar.add(key)
+    mixed = seen_list & seen_scalar
+    if not mixed:
+        return
+    for row in rows:
+        for key in mixed:
+            if key in row and not isinstance(row[key], list) and row[key] is not None:
+                row[key] = [row[key]]
+
+
+def _wkb_field(name: str, crs: str | None) -> pa.Field:
+    """
+    Build a PyArrow field with geoarrow.wkb extension type metadata.
+
+    Parameters
+    ----------
+    name
+        Column name.
+    crs
+        Authority code string (e.g. ``"EPSG:4326"``) or ``None``.
+
+    Returns
+    -------
+    field
+        Arrow field carrying the geoarrow.wkb extension metadata.
+    """
+    crs_token = (crs or "").upper()
+    metadata = {
+        b"ARROW:extension:name": b"geoarrow.wkb",
+        b"ARROW:extension:metadata": (
+            b'{"crs":"' + crs_token.encode("ascii") + b'","edges":"planar"}'
+        ),
+    }
+    return pa.field(name, pa.binary(), nullable=True, metadata=metadata)
+
+
+def _attach_geoarrow(tbl: pa.Table, name: str, crs: str | None) -> pa.Table:
+    """
+    Replace the named binary column's field with a geoarrow.wkb field.
+
+    Parameters
+    ----------
+    tbl
+        Source Arrow table.
+    name
+        Column name to upgrade.
+    crs
+        CRS authority code; embedded in the field metadata.
+
+    Returns
+    -------
+    tbl
+        Table with the named column carrying geoarrow.wkb metadata.
+    """
+    if name not in tbl.column_names:
+        return tbl
+    fields = list(tbl.schema)
+    idx = tbl.schema.get_field_index(name)
+    fields[idx] = _wkb_field(name, crs)
+    new_schema = pa.schema(fields, metadata=tbl.schema.metadata)
+    return tbl.cast(new_schema, safe=False)
+
+
+def _crs_token(crs: Any) -> str | None:  # noqa: ANN401
+    """
+    Coerce a CRS-like object to an authority-code string.
+
+    Parameters
+    ----------
+    crs
+        A pyproj CRS, an EPSG-style string, or ``None``.
+
+    Returns
+    -------
+    token
+        e.g. ``"EPSG:4326"`` or ``None`` if unknown.
+    """
+    if crs is None:
+        return None
+    if isinstance(crs, str):
+        return crs.upper()
+    # pyproj.CRS or similar — try the to_string variants
+    for attr in ("to_string", "srs"):
+        if hasattr(crs, attr):
+            value = getattr(crs, attr)
+            value = value() if callable(value) else value
+            if isinstance(value, str) and value:
+                return value.upper()
+    return str(crs)
+
+
+@overload
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> tuple[pa.Table, pa.Table]: ...
+
+
+@overload
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    nodes: Literal[True],
+    edges: Literal[True],
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> tuple[pa.Table, pa.Table]: ...
+
+
+@overload
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    nodes: Literal[True],
+    edges: Literal[False],
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> pa.Table: ...
+
+
+@overload
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    nodes: Literal[False],
+    edges: Literal[True],
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> pa.Table: ...
+
+
+def graph_to_arrow(
+    G: nx.MultiGraph | nx.MultiDiGraph,
+    *,
+    nodes: bool = True,
+    edges: bool = True,
+    node_geometry: bool = True,
+    fill_edge_geometry: bool = True,
+) -> pa.Table | tuple[pa.Table, pa.Table]:
+    """
+    Convert a graph to node and/or edge Arrow tables.
+
+    Returns the Arrow analog of ``graph_to_gdfs``: nodes and edges as
+    ``pa.Table``s with a ``geoarrow.wkb`` ``geometry`` column carrying CRS
+    metadata. Node identifiers ride in an ``osmid`` column; edge endpoints
+    ride in ``u``, ``v``, ``key`` columns. All other node/edge attributes
+    are preserved as columns; types are inferred via Polars and converted
+    to Arrow.
+
+    Parameters
+    ----------
+    G
+        Input graph.
+    nodes
+        If True, emit a nodes Arrow table.
+    edges
+        If True, emit an edges Arrow table.
+    node_geometry
+        If True, attach a ``geometry`` column built from each node's
+        ``x``/``y`` attributes.
+    fill_edge_geometry
+        If True, synthesize a LineString edge ``geometry`` from endpoint
+        node coordinates when the edge does not already carry one.
+
+    Returns
+    -------
+    nodes_tbl or edges_tbl or (nodes_tbl, edges_tbl)
+        Arrow tables matching the requested outputs.
+    """
+    crs = _crs_token(G.graph.get("crs"))
+
+    nodes_tbl: pa.Table | None = None
+    edges_tbl: pa.Table | None = None
+
+    if nodes:
+        if len(G.nodes) == 0:  # pragma: no cover
+            msg = "Graph contains no nodes."
+            raise ValueError(msg)
+
+        node_rows = [{"osmid": n, **data} for n, data in G.nodes(data=True)]
+        _coerce_mixed_scalar_list(node_rows)
+        nodes_df = pl.DataFrame(node_rows, infer_schema_length=None, strict=False)
+
+        if node_geometry:
+            xs = nodes_df.get_column("x").to_numpy()
+            ys = nodes_df.get_column("y").to_numpy()
+            wkbs = shapely.to_wkb(shapely.points(xs, ys))
+            nodes_df = nodes_df.with_columns(pl.Series("geometry", wkbs, dtype=pl.Binary))
+
+        nodes_tbl = nodes_df.to_arrow()
+        if node_geometry:
+            nodes_tbl = _attach_geoarrow(nodes_tbl, "geometry", crs)
+        utils.log("Created nodes Arrow table from graph", level=lg.INFO)
+
+    if edges:
+        if len(G.edges) == 0:  # pragma: no cover
+            msg = "Graph contains no edges."
+            raise ValueError(msg)
+
+        node_coords = {n: (G.nodes[n]["x"], G.nodes[n]["y"]) for n in G}
+        edge_rows: list[dict[str, Any]] = []
+        for u, v, k, data in G.edges(keys=True, data=True):
+            row: dict[str, Any] = {"u": u, "v": v, "key": k, **data}
+            geom = data.get("geometry")
+            if geom is None and fill_edge_geometry:
+                geom = LineString((node_coords[u], node_coords[v]))
+            row["geometry"] = shapely.to_wkb(geom) if geom is not None else None
+            edge_rows.append(row)
+
+        _coerce_mixed_scalar_list(edge_rows)
+        edges_df = pl.DataFrame(edge_rows, infer_schema_length=None, strict=False)
+        edges_tbl = edges_df.to_arrow()
+        edges_tbl = _attach_geoarrow(edges_tbl, "geometry", crs)
+        utils.log("Created edges Arrow table from graph", level=lg.INFO)
+
+    if nodes and edges:
+        return nodes_tbl, edges_tbl  # type: ignore[return-value]
+    if nodes:
+        return nodes_tbl  # type: ignore[return-value]
+    if edges:
+        return edges_tbl  # type: ignore[return-value]
+    msg = "You must request nodes or edges or both."
+    raise ValueError(msg)
+
+
+def graph_from_arrow(  # noqa: PLR0912
+    nodes_tbl: pa.Table,
+    edges_tbl: pa.Table,
+    *,
+    graph_attrs: dict[str, Any] | None = None,
+) -> nx.MultiDiGraph:
+    """
+    Convert node/edge Arrow tables into a MultiDiGraph.
+
+    Inverse of ``graph_to_arrow``. ``nodes_tbl`` must have an ``osmid``
+    column and contain ``x``/``y`` columns; ``edges_tbl`` must have
+    ``u``, ``v``, ``key`` columns. Any ``geometry`` column is interpreted
+    as WKB (geoarrow.wkb) and decoded into shapely geometries.
+
+    Parameters
+    ----------
+    nodes_tbl
+        Arrow table of nodes. Must contain ``osmid``, ``x``, ``y``.
+    edges_tbl
+        Arrow table of edges. Must contain ``u``, ``v``, ``key``.
+    graph_attrs
+        Optional ``G.graph`` attribute dict. If ``None``, the CRS is
+        recovered from the geometry column metadata.
+
+    Returns
+    -------
+    G
+        The reconstructed MultiDiGraph.
+    """
+    for required in ("osmid", "x", "y"):
+        if required not in nodes_tbl.column_names:
+            msg = f"`nodes_tbl` must contain `{required}` column."
+            raise ValueError(msg)
+    for required in ("u", "v", "key"):
+        if required not in edges_tbl.column_names:
+            msg = f"`edges_tbl` must contain `{required}` column."
+            raise ValueError(msg)
+
+    if graph_attrs is None:
+        meta = (edges_tbl.schema.field("geometry").metadata
+                if "geometry" in edges_tbl.column_names else None) or {}
+        ext_meta = meta.get(b"ARROW:extension:metadata", b"")
+        crs = None
+        if b'"crs":"' in ext_meta:
+            start = ext_meta.find(b'"crs":"') + len(b'"crs":"')
+            end = ext_meta.find(b'"', start)
+            crs_value = ext_meta[start:end].decode("ascii")
+            if crs_value:
+                crs = crs_value
+        graph_attrs = {"crs": crs} if crs else {}
+
+    G = nx.MultiDiGraph(**graph_attrs)
+
+    nodes_rows = nodes_tbl.to_pylist()
+    edges_rows = edges_tbl.to_pylist()
+
+    geom_in_nodes = "geometry" in nodes_tbl.column_names
+    geom_in_edges = "geometry" in edges_tbl.column_names
+
+    for row in edges_rows:
+        u = row.pop("u")
+        v = row.pop("v")
+        k = row.pop("key")
+        if geom_in_edges:
+            wkb = row.get("geometry")
+            row["geometry"] = shapely.from_wkb(wkb) if wkb is not None else None
+        # drop nulls so edges only get attributes with non-null values
+        attrs = {key: val for key, val in row.items() if val is not None}
+        G.add_edge(u, v, key=k, **attrs)
+
+    for row in nodes_rows:
+        osmid = row.pop("osmid")
+        if geom_in_nodes:
+            row.pop("geometry", None)  # x/y are authoritative
+        attrs = {key: val for key, val in row.items() if val is not None}
+        if osmid in G.nodes:
+            G.nodes[osmid].update(attrs)
+        else:
+            G.add_node(osmid, **attrs)
+
+    utils.log("Created graph from node/edge Arrow tables", level=lg.INFO)
     return G
 
 

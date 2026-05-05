@@ -4,22 +4,20 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import json
 import logging as lg
 from pathlib import Path
-from typing import TYPE_CHECKING
 from typing import Any
 
 import networkx as nx
-import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 from shapely import wkt
 
 from . import _osm_xml
 from . import convert
 from . import settings
 from . import utils
-
-if TYPE_CHECKING:
-    import geopandas as gpd
 
 
 def save_graph_geopackage(
@@ -46,23 +44,44 @@ def save_graph_geopackage(
     encoding
         The character encoding of the saved GeoPackage file.
     """
+    from pyogrio.raw import write_arrow  # noqa: PLC0415
+
     # default filepath if none was provided
     filepath = Path(settings.data_folder) / "graph.gpkg" if filepath is None else Path(filepath)
 
     # if save folder does not already exist, create it
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
-    # convert graph to gdfs and stringify non-numeric columns
-    if directed:
-        gdf_nodes, gdf_edges = convert.graph_to_gdfs(G)
-    else:
-        gdf_nodes, gdf_edges = convert.graph_to_gdfs(convert.to_undirected(G))
-    gdf_nodes = _stringify_nonnumeric_cols(gdf_nodes)
-    gdf_edges = _stringify_nonnumeric_cols(gdf_edges)
+    # convert graph to Arrow tables (undirected variant when directed=False)
+    source = G if directed else convert.to_undirected(G)
+    nodes_tbl, edges_tbl = convert.graph_to_arrow(source)
+    nodes_tbl = _stringify_nonnumeric_arrow(nodes_tbl)
+    edges_tbl = _stringify_nonnumeric_arrow(edges_tbl)
 
-    # save the nodes and edges as GeoPackage layers
-    gdf_nodes.to_file(filepath, layer="nodes", driver="GPKG", index=True, encoding=encoding)
-    gdf_edges.to_file(filepath, layer="edges", driver="GPKG", index=True, encoding=encoding)
+    # write each layer via pyogrio's Arrow path; pyogrio reads geoarrow.wkb
+    # extension metadata to identify the geometry column.
+    crs = G.graph.get("crs")
+    write_arrow(
+        nodes_tbl,
+        str(filepath),
+        layer="nodes",
+        driver="GPKG",
+        crs=crs,
+        geometry_name="geometry",
+        geometry_type="Point",
+        encoding=encoding,
+    )
+    write_arrow(
+        edges_tbl,
+        str(filepath),
+        layer="edges",
+        driver="GPKG",
+        crs=crs,
+        geometry_name="geometry",
+        geometry_type="Unknown",
+        encoding=encoding,
+        append=True,
+    )
 
     msg = f"Saved graph as GeoPackage at {str(filepath)!r}"
     utils.log(msg, level=lg.INFO)
@@ -421,26 +440,52 @@ def _convert_bool_string(value: bool | str) -> bool:  # noqa: FBT001
     raise ValueError(msg)
 
 
-def _stringify_nonnumeric_cols(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def _stringify_nonnumeric_arrow(tbl: pa.Table) -> pa.Table:
     """
-    Make every non-numeric GeoDataFrame column (besides geometry) a string.
+    Stringify every non-numeric, non-geometry column of an Arrow table.
 
-    This allows proper serializing via Fiona of GeoDataFrames with mixed types
-    such as strings and ints in the same column.
+    GDAL's GeoPackage driver does not accept list, struct, or map columns,
+    and chokes on mixed-type object columns. Numeric (integer/float/bool)
+    columns and the ``geometry`` column pass through unchanged; everything
+    else is JSON-encoded (lists/dicts/maps) or string-cast (scalars), with
+    nulls filled to empty strings.
 
     Parameters
     ----------
-    gdf
-        GeoDataFrame to stringify non-numeric columns of.
+    tbl
+        Source Arrow table.
 
     Returns
     -------
-    gdf
-        GeoDataFrame with non-numeric columns stringified.
+    tbl
+        Arrow table whose non-numeric, non-geometry columns are strings.
     """
-    # stringify every non-numeric column other than geometry column
-    for col in (c for c in gdf.columns if c != "geometry"):
-        if not pd.api.types.is_numeric_dtype(gdf[col]):
-            gdf[col] = gdf[col].fillna("").astype(str)
+    new_columns: list[pa.ChunkedArray] = []
+    new_fields: list[pa.Field] = []
+    for field in tbl.schema:
+        col = tbl.column(field.name)
+        if field.name == "geometry" or pa.types.is_integer(field.type) or \
+                pa.types.is_floating(field.type) or pa.types.is_boolean(field.type):
+            new_columns.append(col)
+            new_fields.append(field)
+            continue
 
-    return gdf
+        if pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+            cast = pc.fill_null(col, "").cast(pa.string())
+        elif pa.types.is_list(field.type) or pa.types.is_large_list(field.type) \
+                or pa.types.is_fixed_size_list(field.type) or pa.types.is_map(field.type) \
+                or pa.types.is_struct(field.type):
+            # JSON-encode complex types so they round-trip through GPKG
+            encoded = [
+                "" if v is None else json.dumps(v, default=str)
+                for v in col.to_pylist()
+            ]
+            cast = pa.array(encoded, type=pa.string())
+        else:
+            cast = pc.fill_null(col.cast(pa.string()), "")
+
+        new_columns.append(cast if isinstance(cast, pa.ChunkedArray) else pa.chunked_array([cast]))
+        new_fields.append(pa.field(field.name, pa.string(), nullable=field.nullable,
+                                   metadata=field.metadata))
+
+    return pa.Table.from_arrays(new_columns, schema=pa.schema(new_fields, metadata=tbl.schema.metadata))

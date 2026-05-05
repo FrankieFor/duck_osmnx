@@ -82,10 +82,10 @@ def bench_scale(name: str, bbox: tuple[float, float, float, float]) -> None:
             polygon, tags, PBF_PATH,
         )
 
-        # Stage: Features GDF
+        # Stage: Features Arrow table build
         _timed(
-            "features_gdf",
-            features._create_gdf_from_dfs,
+            "features_table",
+            features._build_table,
             nodes_f, ways_f, rels_f, polygon, tags,
         )
     except Exception as e:

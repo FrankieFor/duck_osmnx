@@ -70,7 +70,7 @@ ducknx is a Python package for working with OpenStreetMap street network data fr
 ### Core Modules
 - **`graph.py`**: Creates street network graphs from local OSM PBF data. Public API: `graph_from_bbox()`, `graph_from_point()`, `graph_from_address()`, `graph_from_place()`, `graph_from_polygon()`. Internal: `_create_graph_from_dfs()` builds a NetworkX graph from node/way DataFrames; `_add_paths()`, `_is_path_one_way()`, `_is_path_reversed()` handle edge directionality.
 - **`_pbf_reader.py`**: Reads local OSM PBF files using DuckDB's spatial extension. Two main functions: `_read_pbf_network_duckdb()` returns node/way DataFrames for graph building; `_read_pbf_features_duckdb()` returns node/way/relation DataFrames with WKB geometries for feature extraction. Helper functions handle network type SQL filters and polygon-to-WKT conversion.
-- **`features.py`**: Creates GeoDataFrames of OSM features (buildings, amenities, etc.). Public API: `features_from_bbox()`, `features_from_point()`, `features_from_address()`, `features_from_place()`, `features_from_polygon()`. Internal: `_create_gdf_from_dfs()` converts DataFrames to a GeoDataFrame; `_filter_features()` applies spatial and tag filtering; `_should_be_polygon()` determines geometry type for closed ways using OSM wiki rules.
+- **`features.py`**: Creates Arrow tables of OSM features (buildings, amenities, etc.). Public API: `features_from_bbox()`, `features_from_point()`, `features_from_address()`, `features_from_place()`, `features_from_polygon()` — all return `pa.Table` with columns `element` (dict<string>), `id` (int64), `tags` (map<string,string>), `geometry` (binary with `geoarrow.wkb` extension type carrying CRS metadata). Internal: `_build_table()` concatenates per-element Arrow tables; `_filter_arrow()` applies spatial filtering via shapely STRtree and tag filtering via `pa.compute.map_lookup`; `_should_be_polygon()` is the Python reference for the SQL polygon-classification CASE expression.
 - **`settings.py`**: Global configuration settings including `pbf_file_path` (must be set before use), `useful_tags_node`/`useful_tags_way`, network types, and CRS defaults.
 - **`routing.py`**: Network routing and shortest path algorithms.
 - **`plot.py`**: Visualization functions for graphs and networks.
@@ -113,10 +113,10 @@ ducknx is a Python package for working with OpenStreetMap street network data fr
 - Deduplicates consecutive nodes, adds edge directionality via `_add_paths()`
 - Adds great-circle edge lengths
 
-**`features._create_gdf_from_dfs(nodes_df, ways_df, relations_df, polygon, tags)`**
-- Converts WKB geometries to Shapely objects
-- Applies `_should_be_polygon()` to refine closed-way geometry types using full OSM wiki rules
-- Assembles a GeoDataFrame indexed by `(element_type, osm_id)`
+**`features._build_table(nodes_tbl, ways_tbl, relations_tbl, polygon, tags)`**
+- Normalizes per-element Arrow tables (drops null/empty geometries, prepends `element` column, casts `tags` to a canonical map type)
+- Concatenates them and applies spatial + tag filtering via `_filter_arrow()`
+- Attaches `geoarrow.wkb` extension type to the geometry field with CRS metadata, then returns a `pa.Table`
 
 ## Code Style and Standards
 
