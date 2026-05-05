@@ -1,4 +1,4 @@
-"""Project a graph, GeoDataFrame, or geometry to a different CRS."""
+"""Project a graph or geometry to a different CRS."""
 
 from __future__ import annotations
 
@@ -6,34 +6,79 @@ import logging as lg
 from typing import TYPE_CHECKING
 from typing import Any
 
-import geopandas as gpd
+import networkx as nx
+import numpy as np
+import pyproj
+import shapely
 
-from . import convert
 from . import settings
 from . import utils
 
 if TYPE_CHECKING:
-    import networkx as nx
     from shapely import Geometry
+
+
+# UTM applicability bounds (latitude degrees)
+_UTM_SOUTH_LIMIT = -80
+_UTM_NORTH_LIMIT = 84
 
 
 def is_projected(crs: Any) -> bool:  # noqa: ANN401
     """
-    Determine if a coordinate reference system is projected or not.
+    Determine if a coordinate reference system is projected.
 
     Parameters
     ----------
     crs
-        The identifier of the coordinate reference system. This can be
-        anything accepted by `pyproj.CRS.from_user_input()`, such as an
-        authority string or a WKT string.
+        Anything accepted by ``pyproj.CRS.from_user_input`` — authority
+        string (e.g. ``"EPSG:4326"``), WKT, or a CRS object.
 
     Returns
     -------
     projected
         True if `crs` is projected, otherwise False.
     """
-    return bool(gpd.GeoSeries(crs=crs).crs.is_projected)
+    return bool(pyproj.CRS.from_user_input(crs).is_projected)
+
+
+def _estimate_utm_crs(xs: np.ndarray, ys: np.ndarray, src_crs: Any) -> pyproj.CRS:  # noqa: ANN401
+    """
+    Pick an appropriate UTM (or UPS) CRS for the given lon/lat bounds.
+
+    Parameters
+    ----------
+    xs, ys
+        Coordinate arrays in `src_crs`.
+    src_crs
+        Source CRS for the input coordinates.
+
+    Returns
+    -------
+    crs
+        The chosen target CRS.
+    """
+    # transform bounds to lon/lat to evaluate UTM zone applicability
+    src = pyproj.CRS.from_user_input(src_crs)
+    if src.is_geographic:
+        lons, lats = xs, ys
+    else:
+        transformer = pyproj.Transformer.from_crs(src, "EPSG:4326", always_xy=True)
+        lons, lats = transformer.transform(xs, ys)
+
+    min_lat = float(np.min(lats))
+    max_lat = float(np.max(lats))
+
+    if min_lat < _UTM_SOUTH_LIMIT:
+        return pyproj.CRS.from_user_input("EPSG:32761")  # UPS South
+    if max_lat > _UTM_NORTH_LIMIT:
+        return pyproj.CRS.from_user_input("EPSG:32661")  # UPS North
+
+    # estimate UTM zone via the centroid of the bounding box
+    center_lon = (float(np.min(lons)) + float(np.max(lons))) / 2
+    center_lat = (min_lat + max_lat) / 2
+    utm_zone = int((center_lon + 180) // 6) + 1
+    epsg = 32600 + utm_zone if center_lat >= 0 else 32700 + utm_zone
+    return pyproj.CRS.from_user_input(f"EPSG:{epsg}")
 
 
 def project_geometry(
@@ -46,96 +91,42 @@ def project_geometry(
     """
     Project a Shapely geometry from its current CRS to another.
 
-    If `to_latlong` is True, this projects the geometry to the coordinate
-    reference system defined by `settings.default_crs`. Otherwise it projects
-    it to the CRS defined by `to_crs`. If `to_crs` is `None`, it projects it
-    to the CRS of an appropriate UTM (or UPS) zone given `geometry`'s bounds.
-
     Parameters
     ----------
     geom
-        The geometry to be projected.
+        Geometry to project.
     crs
-        The initial CRS of `geometry`. If None, it will be set to
-        `settings.default_crs`.
+        Initial CRS of `geom`. Defaults to ``settings.default_crs``.
     to_crs
-        If None, project to an appropriate UTM zone. Otherwise project to this
-        CRS.
+        Target CRS. If None and not `to_latlong`, an appropriate UTM zone
+        is selected from the geometry bounds.
     to_latlong
-        If True, project to `settings.default_crs` and ignore `to_crs`.
+        If True, project to ``settings.default_crs`` and ignore `to_crs`.
 
     Returns
     -------
-    geom_proj, crs
-        The projected geometry and its new CRS.
+    geom_proj, target_crs
+        The projected geometry and its CRS.
     """
-    if crs is None:
-        crs = settings.default_crs
+    src_crs = settings.default_crs if crs is None else crs
 
-    gdf = gpd.GeoDataFrame(geometry=[geom], crs=crs)
-    gdf_proj = project_gdf(gdf, to_crs=to_crs, to_latlong=to_latlong)
-    geom_proj = gdf_proj["geometry"].iloc[0]
-    return geom_proj, gdf_proj.crs
-
-
-def project_gdf(
-    gdf: gpd.GeoDataFrame,
-    *,
-    to_crs: Any | None = None,  # noqa: ANN401
-    to_latlong: bool = False,
-) -> gpd.GeoDataFrame:
-    """
-    Project a GeoDataFrame from its current CRS to another.
-
-    If `to_latlong` is True, this projects the GeoDataFrame to the coordinate
-    reference system defined by `settings.default_crs`. Otherwise it projects
-    it to the CRS defined by `to_crs`. If `to_crs` is `None`, it projects it
-    to the CRS of an appropriate UTM (or UPS) zone given `gdf`'s bounds.
-
-    Parameters
-    ----------
-    gdf
-        The GeoDataFrame to be projected.
-    to_crs
-        If None, project to an appropriate UTM zone. Otherwise project to
-        this CRS.
-    to_latlong
-        If True, project to `settings.default_crs` and ignore `to_crs`.
-
-    Returns
-    -------
-    gdf_proj
-        The projected GeoDataFrame.
-    """
-    if gdf.crs is None or len(gdf) == 0:  # pragma: no cover
-        msg = "`gdf` must have a valid CRS and cannot be empty."
-        raise ValueError(msg)
-
-    # if to_latlong is True, project the gdf to the default_crs
     if to_latlong:
-        to_crs = settings.default_crs
+        target = pyproj.CRS.from_user_input(settings.default_crs)
+    elif to_crs is not None:
+        target = pyproj.CRS.from_user_input(to_crs)
+    else:
+        coords = np.asarray(geom.bounds)  # (minx, miny, maxx, maxy)
+        xs = coords[[0, 2]]
+        ys = coords[[1, 3]]
+        target = _estimate_utm_crs(xs, ys, src_crs)
 
-    # else if to_crs is None, project gdf to an appropriate UTM zone
-    elif to_crs is None:
-        # if polygon is outside UTM limits (80 deg south, 84 deg north), then
-        # we must use universal polar stereographic coordinate system instead
-        UTM_SOUTH_LIMIT = -80
-        UTM_NORTH_LIMIT = 84
-        if gdf.total_bounds[1] < UTM_SOUTH_LIMIT:
-            to_crs = "epsg:32761"
-        elif gdf.total_bounds[3] > UTM_NORTH_LIMIT:
-            to_crs = "epsg:32661"
-        else:
-            # otherwise, we're within UTM limits, so determine UTM zone
-            to_crs = gdf.estimate_utm_crs()
-
-    # project the gdf
-    gdf_proj = gdf.to_crs(to_crs)
-    crs_desc = f"{gdf_proj.crs.to_string()} / {gdf_proj.crs.name}"
-
-    msg = f"Projected GeoDataFrame to {crs_desc!r}"
+    transformer = pyproj.Transformer.from_crs(
+        pyproj.CRS.from_user_input(src_crs), target, always_xy=True,
+    )
+    geom_proj = shapely.ops.transform(transformer.transform, geom)
+    msg = f"Projected geometry to {target.to_string()!r}"
     utils.log(msg, level=lg.INFO)
-    return gdf_proj
+    return geom_proj, target
 
 
 def project_graph(
@@ -147,54 +138,57 @@ def project_graph(
     """
     Project a graph from its current CRS to another.
 
-    If `to_latlong` is True, this projects the graph to the coordinate
-    reference system defined by `settings.default_crs`. Otherwise it projects
-    it to the CRS defined by `to_crs`. If `to_crs` is `None`, it projects it
-    to the CRS of an appropriate UTM (or UPS) zone given `geometry`'s bounds.
-
     Parameters
     ----------
     G
-        The graph to be projected.
+        Graph to project. Must have a ``crs`` graph attribute.
     to_crs
-        If None, project to an appropriate UTM zone. Otherwise project to
-        this CRS.
+        Target CRS. If None and not `to_latlong`, an appropriate UTM zone
+        is chosen from node coordinates.
     to_latlong
-        If True, project to `settings.default_crs` and ignore `to_crs`.
+        If True, project to ``settings.default_crs`` and ignore `to_crs`.
 
     Returns
     -------
     G_proj
         The projected graph.
     """
+    src_crs = pyproj.CRS.from_user_input(G.graph["crs"])
+
+    # collect node coords
+    osmids = list(G.nodes)
+    xs = np.fromiter((G.nodes[n]["x"] for n in osmids), dtype=np.float64,
+                     count=len(osmids))
+    ys = np.fromiter((G.nodes[n]["y"] for n in osmids), dtype=np.float64,
+                     count=len(osmids))
+
     if to_latlong:
-        to_crs = settings.default_crs
-
-    # STEP 1: PROJECT THE NODES
-    gdf_nodes = convert.graph_to_gdfs(G, edges=False)
-
-    # project the nodes GeoDataFrame and extract the projected x/y values
-    gdf_nodes_proj = project_gdf(gdf_nodes, to_crs=to_crs)
-    gdf_nodes_proj["x"] = gdf_nodes_proj["geometry"].x
-    gdf_nodes_proj["y"] = gdf_nodes_proj["geometry"].y
-    to_crs = gdf_nodes_proj.crs
-
-    # STEP 2: PROJECT THE EDGES
-    if G.graph.get("simplified"):
-        # if graph has previously been simplified, project the edge geometries
-        gdf_edges = convert.graph_to_gdfs(G, nodes=False, fill_edge_geometry=False)
-        gdf_edges_proj = project_gdf(gdf_edges, to_crs=to_crs)
+        target = pyproj.CRS.from_user_input(settings.default_crs)
+    elif to_crs is not None:
+        target = pyproj.CRS.from_user_input(to_crs)
     else:
-        # if not, you don't have to project these edges because the nodes
-        # contain all the spatial data in the graph (unsimplified edges have
-        # no geometry attributes)
-        gdf_edges_proj = convert.graph_to_gdfs(G, nodes=False, fill_edge_geometry=False)
+        target = _estimate_utm_crs(xs, ys, src_crs)
 
-    # STEP 3: REBUILD GRAPH
-    # turn projected node/edge gdfs into a graph and update its CRS attribute
-    G_proj = convert.graph_from_gdfs(gdf_nodes_proj, gdf_edges_proj, graph_attrs=G.graph)
-    G_proj.graph["crs"] = to_crs
+    transformer = pyproj.Transformer.from_crs(src_crs, target, always_xy=True)
+    new_xs, new_ys = transformer.transform(xs, ys)
 
-    msg = f"Projected graph with {len(G)} nodes and {len(G.edges)} edges"
+    # rebuild graph with projected node coordinates and (if simplified) edge geometries
+    G_proj = G.copy()
+    for osmid, x, y in zip(osmids, new_xs, new_ys, strict=True):
+        G_proj.nodes[osmid]["x"] = float(x)
+        G_proj.nodes[osmid]["y"] = float(y)
+
+    if G.graph.get("simplified"):
+        for _u, _v, _k, data in G_proj.edges(keys=True, data=True):
+            geom = data.get("geometry")
+            if geom is not None:
+                data["geometry"] = shapely.ops.transform(transformer.transform, geom)
+
+    G_proj.graph["crs"] = target
+
+    msg = (
+        f"Projected graph with {len(G)} nodes and {len(G.edges)} edges to "
+        f"{target.to_string()!r}"
+    )
     utils.log(msg, level=lg.INFO)
     return G_proj

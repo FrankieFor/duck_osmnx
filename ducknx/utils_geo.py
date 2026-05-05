@@ -11,21 +11,20 @@ from warnings import warn
 
 import networkx as nx
 import numpy as np
+import pyarrow as pa
+import shapely
 from shapely import Geometry
 from shapely import LineString
 from shapely import MultiPolygon
 from shapely import Polygon
 from shapely.ops import split
 
-from . import convert
 from . import projection
 from . import settings
 from . import utils
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-    import geopandas as gpd
 
 
 def buffer_geometry(geom: Geometry, dist: float) -> Geometry:
@@ -54,38 +53,82 @@ def buffer_geometry(geom: Geometry, dist: float) -> Geometry:
     return geom_buff
 
 
-def sample_points(G: nx.MultiGraph, n: int) -> gpd.GeoSeries:
+def sample_points(G: nx.MultiGraph, n: int) -> pa.Table:
     """
     Randomly sample points constrained to a spatial graph.
 
-    This generates a graph-constrained uniform random sample of points. Unlike
-    typical spatially uniform random sampling, this method accounts for the
-    graph's geometry. And unlike equal-length edge segmenting, this method
-    guarantees uniform randomness.
+    Generates a graph-constrained uniform random sample of points,
+    weighting each edge by its length so longer edges receive
+    proportionally more samples.
 
     Parameters
     ----------
     G
-        Graph from which to sample points. Should be undirected (to avoid
-        oversampling bidirectional edges) and projected (for accurate point
-        interpolation).
+        Graph from which to sample points. Should be undirected (to
+        avoid oversampling bidirectional edges) and projected (for
+        accurate interpolation).
     n
         How many points to sample.
 
     Returns
     -------
-    points
-        The sampled points, multi-indexed by `(u, v, key)` of the edge from
-        which each point was sampled.
+    table
+        Arrow table with a single ``geometry`` column (geoarrow.wkb)
+        carrying CRS metadata in the field.
     """
     if nx.is_directed(G):  # pragma: no cover
         msg = "`G` should be undirected to avoid oversampling bidirectional edges."
         warn(msg, category=UserWarning, stacklevel=2)
-    gdf_edges = convert.graph_to_gdfs(G, nodes=False)[["geometry", "length"]]
-    weights = gdf_edges["length"] / gdf_edges["length"].sum()
-    idx = np.random.default_rng().choice(gdf_edges.index, size=n, p=weights)
-    lines = gdf_edges.loc[idx, "geometry"]
-    return lines.interpolate(np.random.default_rng().random(n), normalized=True)
+
+    # collect each edge's geometry (synthesized from endpoint nodes when missing)
+    geoms: list[LineString] = []
+    lengths: list[float] = []
+    for u, v, _k, data in G.edges(keys=True, data=True):
+        geom = data.get("geometry")
+        if geom is None:
+            geom = LineString((
+                (G.nodes[u]["x"], G.nodes[u]["y"]),
+                (G.nodes[v]["x"], G.nodes[v]["y"]),
+            ))
+        geoms.append(geom)
+        lengths.append(float(data["length"]))
+    weights = np.asarray(lengths, dtype=np.float64)
+    weights /= weights.sum()
+
+    rng = np.random.default_rng()
+    idx = rng.choice(len(geoms), size=n, p=weights)
+    fractions = rng.random(n)
+    sampled = [geoms[i].interpolate(fractions[j], normalized=True)
+               for j, i in enumerate(idx)]
+    wkbs = shapely.to_wkb(np.asarray(sampled, dtype=object))
+
+    crs = G.graph.get("crs")
+    crs_token = ""
+    if crs is not None:
+        if isinstance(crs, str):
+            crs_token = crs.upper()
+        else:
+            for attr in ("to_string", "srs"):
+                if hasattr(crs, attr):
+                    value = getattr(crs, attr)
+                    value = value() if callable(value) else value
+                    if isinstance(value, str) and value:
+                        crs_token = value.upper()
+                        break
+            else:
+                crs_token = str(crs).upper()
+
+    field = pa.field(
+        "geometry", pa.binary(), nullable=True,
+        metadata={
+            b"ARROW:extension:name": b"geoarrow.wkb",
+            b"ARROW:extension:metadata": (
+                b'{"crs":"' + crs_token.encode("ascii") + b'","edges":"planar"}'
+            ),
+        },
+    )
+    return pa.Table.from_arrays([pa.array(wkbs, type=pa.binary())],
+                                 schema=pa.schema([field]))
 
 
 def interpolate_points(geom: LineString, dist: float) -> Iterator[tuple[float, float]]:
@@ -217,59 +260,6 @@ def _quadrat_cut_geometry(geom: Polygon | MultiPolygon, quadrat_width: float) ->
         geoms = [g for g_list in split_geoms for g in g_list]
 
     return MultiPolygon(geoms)
-
-
-def _intersect_index_quadrats(
-    geoms: gpd.GeoSeries,
-    polygon: Polygon | MultiPolygon,
-) -> set[Any]:
-    """
-    Identify geometries that intersect a (Multi)Polygon.
-
-    Uses an r-tree spatial index and cuts polygon up into smaller sub-polygons
-    for r-tree acceleration. Ensure that geometries and polygon are in the
-    same coordinate reference system.
-
-    Parameters
-    ----------
-    geoms
-        The geometries to intersect with the polygon.
-    polygon
-        The polygon to intersect with the geometries.
-
-    Returns
-    -------
-    geoms_in_poly
-        The index labels of the geometries that intersected the polygon.
-    """
-    # create an r-tree spatial index for the geometries
-    rtree = geoms.sindex
-    msg = f"Built r-tree spatial index for {len(geoms):,} geometries"
-    utils.log(msg, level=lg.INFO)
-
-    # cut polygon into chunks for faster spatial index intersecting. specify a
-    # sensible quadrat_width to balance performance (eg, 0.1 degrees is approx
-    # 8 km at NYC's latitude) with either projected or unprojected coordinates
-    quadrat_width = max(0.1, np.sqrt(polygon.area) / 10)
-    multipoly = _quadrat_cut_geometry(polygon, quadrat_width)
-    msg = f"Accelerating r-tree with {len(multipoly.geoms)} quadrats"
-    utils.log(msg, level=lg.INFO)
-
-    # loop through each chunk of the polygon to find intersecting geometries
-    # first find approximate matches with spatial index, then precise matches
-    # from those approximate ones
-    geoms_in_poly = set()
-    for poly in multipoly.geoms:
-        poly_buff = poly.buffer(0)
-        if poly_buff.is_valid and poly_buff.area > 0:
-            possible_matches_iloc = rtree.intersection(poly_buff.bounds)
-            possible_matches = geoms.iloc[list(possible_matches_iloc)]
-            precise_matches = possible_matches[possible_matches.intersects(poly_buff)]
-            geoms_in_poly.update(precise_matches.index)
-
-    msg = f"Identified {len(geoms_in_poly):,} geometries inside polygon"
-    utils.log(msg, level=lg.INFO)
-    return geoms_in_poly
 
 
 # dist present, project_utm missing/False, return_crs missing/False

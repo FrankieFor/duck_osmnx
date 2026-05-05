@@ -7,9 +7,9 @@ For file format information see https://wiki.openstreetmap.org/wiki/OSM_XML
 from __future__ import annotations
 
 import logging as lg
+import math
 from importlib.metadata import version as metadata_version
 from pathlib import Path
-from typing import TYPE_CHECKING
 from typing import Any
 from warnings import warn
 from xml.etree.ElementTree import Element
@@ -17,7 +17,7 @@ from xml.etree.ElementTree import ElementTree
 from xml.etree.ElementTree import SubElement
 
 import networkx as nx
-import pandas as pd
+import polars as pl
 
 from . import convert
 from . import projection
@@ -26,8 +26,14 @@ from . import truncate
 from . import utils
 from ._errors import GraphSimplificationError
 
-if TYPE_CHECKING:
-    import geopandas as gpd
+
+def _is_present(value: Any) -> bool:  # noqa: ANN401
+    """Return True iff ``value`` is non-null and not a NaN float."""
+    if value is None:
+        return False
+    if isinstance(value, float) and math.isnan(value):
+        return False
+    return True
 
 
 # default values for standard "node" and "way" XML subelement attributes
@@ -107,40 +113,56 @@ def _save_graph_xml(
     filepath = Path(settings.data_folder) / "graph.osm" if filepath is None else Path(filepath)
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
-    # convert graph to node/edge gdfs and create dict of spatial bounds
-    gdf_nodes, gdf_edges = convert.graph_to_gdfs(G, fill_edge_geometry=False)
-    coords = [str(round(c, PRECISION)) for c in gdf_nodes.union_all().bounds]
-    bounds = dict(zip(["minlon", "minlat", "maxlon", "maxlat"], coords))
+    # convert graph to node/edge Arrow tables, then to polars for processing
+    nodes_tbl, edges_tbl = convert.graph_to_arrow(G, fill_edge_geometry=False)
+    nodes_df = pl.from_arrow(nodes_tbl)
+    edges_df = pl.from_arrow(edges_tbl)
+    if not isinstance(nodes_df, pl.DataFrame):
+        nodes_df = pl.DataFrame(nodes_df)
+    if not isinstance(edges_df, pl.DataFrame):
+        edges_df = pl.DataFrame(edges_df)
 
-    # add default values (if missing) for standard attrs
-    for gdf in (gdf_nodes, gdf_edges):
-        for col, value in ATTR_DEFAULTS.items():
-            if col not in gdf.columns:
-                gdf[col] = value
-            else:
-                gdf[col] = gdf[col].fillna(value)
+    # spatial bounds: built directly from x/y arrays
+    xs = nodes_df.get_column("x").to_numpy()
+    ys = nodes_df.get_column("y").to_numpy()
+    coords = [
+        str(round(float(xs.min()), PRECISION)),
+        str(round(float(ys.min()), PRECISION)),
+        str(round(float(xs.max()), PRECISION)),
+        str(round(float(ys.max()), PRECISION)),
+    ]
+    bounds = dict(zip(["minlon", "minlat", "maxlon", "maxlat"], coords, strict=True))
 
-    # transform nodes gdf to meet OSM XML spec
-    # 1) reset index (osmid) then rename osmid, x, and y columns
-    # 2) round lat/lon coordinates
-    # 3) drop unnecessary geometry column
-    gdf_nodes = gdf_nodes.reset_index().rename(columns={"osmid": "id", "x": "lon", "y": "lat"})
-    gdf_nodes[["lon", "lat"]] = gdf_nodes[["lon", "lat"]].round(PRECISION)
-    gdf_nodes = gdf_nodes.drop(columns=["geometry"])
+    nodes_df = _ensure_attr_defaults(nodes_df)
+    edges_df = _ensure_attr_defaults(edges_df)
 
-    # transform edges gdf to meet OSM XML spec
-    # 1) fill and convert oneway bools to strings
-    # 2) rename osmid column (but keep (u, v, k) index for processing)
-    # 3) drop unnecessary geometry column
-    if "oneway" in gdf_edges.columns:
-        gdf_edges["oneway"] = gdf_edges["oneway"].fillna(ONEWAY).replace({True: "yes", False: "no"})
-    gdf_edges = gdf_edges.rename(columns={"osmid": "id"}).drop(columns=["geometry"])
+    # nodes: rename + round lat/lon, drop geometry
+    rename_map = {"osmid": "id", "x": "lon", "y": "lat"}
+    nodes_df = nodes_df.rename({k: v for k, v in rename_map.items() if k in nodes_df.columns})
+    nodes_df = nodes_df.with_columns(
+        pl.col("lon").round(PRECISION),
+        pl.col("lat").round(PRECISION),
+    )
+    if "geometry" in nodes_df.columns:
+        nodes_df = nodes_df.drop("geometry")
+
+    # edges: oneway → "yes"/"no", rename osmid → id, drop geometry
+    if "oneway" in edges_df.columns:
+        edges_df = edges_df.with_columns(
+            pl.col("oneway").fill_null(ONEWAY).map_elements(
+                lambda x: "yes" if x else "no", return_dtype=pl.String,
+            ),
+        )
+    if "osmid" in edges_df.columns:
+        edges_df = edges_df.rename({"osmid": "id"})
+    if "geometry" in edges_df.columns:
+        edges_df = edges_df.drop("geometry")
 
     # create parent XML element then add bounds, nodes, ways as subelements
     element = Element("osm", attrib=ROOT_ATTR_DEFAULTS)
     _ = SubElement(element, "bounds", attrib=bounds)
-    _add_nodes_xml(element, gdf_nodes)
-    _add_ways_xml(element, gdf_edges, way_tag_aggs)
+    _add_nodes_xml(element, nodes_df)
+    _add_ways_xml(element, edges_df, way_tag_aggs)
 
     # write to disk
     ElementTree(element).write(filepath, encoding=encoding, xml_declaration=True)
@@ -148,91 +170,130 @@ def _save_graph_xml(
     utils.log(msg, level=lg.INFO)
 
 
-def _add_nodes_xml(
-    parent: Element,
-    gdf_nodes: gpd.GeoDataFrame,
-) -> None:
+def _ensure_attr_defaults(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Add graph nodes as subelements of an XML parent element.
+    Add or fill the standard OSM XML attribute columns with defaults.
+
+    Parameters
+    ----------
+    df
+        Polars DataFrame of nodes or edges.
+
+    Returns
+    -------
+    df
+        DataFrame with all ``ATTR_DEFAULTS`` columns present and non-null.
+    """
+    cols_to_add: dict[str, Any] = {}
+    fill_exprs: list[pl.Expr] = []
+    for col, value in ATTR_DEFAULTS.items():
+        if col not in df.columns:
+            cols_to_add[col] = value
+        else:
+            fill_exprs.append(pl.col(col).fill_null(value))
+    if cols_to_add:
+        df = df.with_columns([pl.lit(v).alias(k) for k, v in cols_to_add.items()])
+    if fill_exprs:
+        df = df.with_columns(fill_exprs)
+    return df
+
+
+def _add_nodes_xml(parent: Element, nodes_df: pl.DataFrame) -> None:
+    """
+    Add graph nodes as XML subelements.
 
     Parameters
     ----------
     parent
-        The XML parent element.
-    gdf_nodes
-        A GeoDataFrame of graph nodes.
+        Parent XML element.
+    nodes_df
+        Polars DataFrame of nodes (must include ``id``, ``lat``, ``lon``).
     """
     node_tags = set(settings.useful_tags_node)
     node_attrs = {"id", "lat", "lon"}.union(ATTR_DEFAULTS)
 
-    # add each node attrs dict as a SubElement of parent
-    for node in gdf_nodes.to_dict(orient="records"):
-        attrs = {k: str(node[k]) for k in node_attrs if pd.notna(node[k])}
+    for node in nodes_df.iter_rows(named=True):
+        attrs = {k: str(node[k]) for k in node_attrs if k in node and _is_present(node[k])}
         node_element = SubElement(parent, "node", attrib=attrs)
-
-        # add each node tag dict as its own SubElement of the node SubElement
-        # for vals that are non-null (or list if node consolidation was done)
-        tags = (
-            {"k": k, "v": str(node[k])}
-            for k in node_tags & node.keys()
-            if isinstance(node[k], list) or pd.notna(node[k])
-        )
-        for tag in tags:
-            _ = SubElement(node_element, "tag", attrib=tag)
+        for tag_key in node_tags & node.keys():
+            value = node[tag_key]
+            if isinstance(value, list) or _is_present(value):
+                _ = SubElement(node_element, "tag", attrib={"k": tag_key, "v": str(value)})
 
 
 def _add_ways_xml(
     parent: Element,
-    gdf_edges: gpd.GeoDataFrame,
+    edges_df: pl.DataFrame,
     way_tag_aggs: dict[str, Any] | None,
 ) -> None:
     """
-    Add graph edges (grouped as ways) as subelements of an XML parent element.
+    Add graph edges (grouped into OSM ways) as XML subelements.
 
     Parameters
     ----------
     parent
-        The XML parent element.
-    gdf_edges
-        A GeoDataFrame of graph edges with OSM way "id" column for grouping
-        edges into ways.
+        Parent XML element.
+    edges_df
+        Polars DataFrame of edges (must include ``u``, ``v``, ``key``, ``id``).
     way_tag_aggs
-        Keys are OSM way tag keys and values are aggregation functions
-        (anything accepted as an argument by `pandas.agg`). Allows user to
-        aggregate graph edge attribute values into single OSM way values. If
-        None, or if some tag's key does not exist in the dict, the way
-        attribute will be assigned the value of the first edge of the way.
+        Optional per-tag aggregation function (callable or polars-compatible
+        named aggregation) applied across the edges of a single way.
     """
     way_tags = set(settings.useful_tags_way)
     way_attrs = list({"id"}.union(ATTR_DEFAULTS))
 
-    for osmid, way in gdf_edges.groupby("id"):
-        # STEP 1: add the way and its attrs as a "way" subelement of the
-        # parent element
-        attrs = way[way_attrs].iloc[0].astype(str).to_dict()
+    for osmid, way in edges_df.group_by("id", maintain_order=True):
+        osmid_value = osmid[0] if isinstance(osmid, tuple) else osmid
+        first_row = way.row(0, named=True)
+        attrs = {a: str(first_row[a]) for a in way_attrs if a in first_row}
         way_element = SubElement(parent, "way", attrib=attrs)
 
-        # STEP 2: add the way's edges' node IDs as "nd" subelements of the
-        # "way" subelement. if way contains more than 1 edge, sort the nodes
-        # topologically, otherwise just add node "u" then "v" from index.
-        if len(way) == 1:
-            nodes = way.index[0][:2]
+        # node ordering: 1-edge way uses (u, v) directly, otherwise topo-sort
+        if way.height == 1:
+            nodes_seq = (first_row["u"], first_row["v"])
         else:
-            nodes = _sort_nodes(nx.MultiDiGraph(way.index.to_list()), osmid)
-        for node in nodes:
+            uvk = list(zip(
+                way.get_column("u").to_list(),
+                way.get_column("v").to_list(),
+                way.get_column("key").to_list(),
+                strict=True,
+            ))
+            nodes_seq = _sort_nodes(nx.MultiDiGraph(uvk), osmid_value)
+        for node in nodes_seq:
             _ = SubElement(way_element, "nd", attrib={"ref": str(node)})
 
-        # STEP 3: add way's edges' tags as "tag" subelements of the "way"
-        # subelement. if an agg function was provided for a tag, apply it to
-        # the values of the edges in the way. if no agg function was provided
-        # for a tag, just use the value from first edge in way.
-        for tag in way_tags.intersection(way.columns):
+        for tag in way_tags & set(way.columns):
             if way_tag_aggs is not None and tag in way_tag_aggs:
-                value = way[tag].agg(way_tag_aggs[tag])
+                series = way.get_column(tag).drop_nulls()
+                value = _apply_agg(way_tag_aggs[tag], series.to_list()) \
+                    if series.len() else None
             else:
-                value = way[tag].iloc[0]
-            if pd.notna(value):
+                value = way.get_column(tag)[0]
+            if _is_present(value):
                 _ = SubElement(way_element, "tag", attrib={"k": tag, "v": str(value)})
+
+
+def _apply_agg(agg: Any, values: list[Any]) -> Any:  # noqa: ANN401
+    """
+    Apply a callable or named (polars) aggregation to a list of values.
+
+    Parameters
+    ----------
+    agg
+        Either a callable or a polars-compatible aggregation name.
+    values
+        Non-null values to aggregate.
+
+    Returns
+    -------
+    result
+        Aggregated value.
+    """
+    if callable(agg):
+        return agg(values)
+    series = pl.Series(values=values)
+    method = getattr(series, agg)
+    return method()
 
 
 def _sort_nodes(G: nx.MultiDiGraph, osmid: int) -> list[int]:

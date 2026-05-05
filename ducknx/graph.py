@@ -7,13 +7,14 @@ Refer to the Getting Started guide for usage limitations.
 from __future__ import annotations
 
 import logging as lg
+import math
 from collections.abc import Iterable
 from importlib.metadata import version as metadata_version
 from typing import TYPE_CHECKING
 from typing import Any
 
 import networkx as nx
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 from shapely import MultiPolygon
 from shapely import Polygon
@@ -580,7 +581,7 @@ def _build_way_edges(
     attrs: dict[str, Any] = {"osmid": osmid_arr[i]}
     for col in tag_cols:
         val = tag_arrays[col][i]
-        if val is not None and not (isinstance(val, float) and pd.isna(val)):
+        if val is not None and not (isinstance(val, float) and math.isnan(val)):
             attrs[col] = val
 
     # deduplicate consecutive nodes
@@ -610,8 +611,8 @@ def _build_way_edges(
 
 
 def _create_graph_from_dfs(
-    nodes_df: pd.DataFrame | pa.Table,
-    ways_df: pd.DataFrame | pa.Table,
+    nodes_df: pa.Table,
+    ways_df: pa.Table,
     bidirectional: bool,  # noqa: FBT001
     backend: str = "networkx",
 ) -> nx.MultiDiGraph:
@@ -649,12 +650,6 @@ def _create_graph_from_dfs(
         msg = f"Unknown backend: {backend!r}. Use 'networkx' or 'rustworkx'."
         raise ValueError(msg)
 
-    # Convert Arrow tables to pandas if needed
-    if isinstance(nodes_df, pa.Table):
-        nodes_df = nodes_df.to_pandas()
-    if isinstance(ways_df, pa.Table):
-        ways_df = ways_df.to_pandas()
-
     # create the MultiDiGraph and set its graph-level attributes
     metadata = {
         "created_date": utils.ts(),
@@ -663,28 +658,41 @@ def _create_graph_from_dfs(
     }
     G = nx.MultiDiGraph(**metadata)
 
-    # add nodes from DataFrame — bulk insert via dict
-    nodes_df = nodes_df.set_index("id")
-    nodes_df = nodes_df.dropna(axis="columns", how="all")
-    G.add_nodes_from(nodes_df.to_dict("index").items())
+    # add nodes from Arrow table via polars (drop all-null columns, then iter rows)
+    nodes_pl = pl.from_arrow(nodes_df)
+    if not isinstance(nodes_pl, pl.DataFrame):
+        nodes_pl = pl.DataFrame(nodes_pl)
+    drop_cols = [c for c in nodes_pl.columns
+                 if nodes_pl.get_column(c).null_count() == nodes_pl.height]
+    if drop_cols:
+        nodes_pl = nodes_pl.drop(drop_cols)
+    node_items: list[tuple[int, dict[str, Any]]] = []
+    for row in nodes_pl.iter_rows(named=True):
+        osm_id = row.pop("id")
+        node_items.append((osm_id, {k: v for k, v in row.items() if v is not None}))
+    G.add_nodes_from(node_items)
 
-    # build edge tuples in bulk instead of per-row iteration
-    tag_cols = [c for c in ways_df.columns if c not in ("osmid", "refs")]
+    # build edge tuples in bulk via polars→numpy column extraction
+    ways_pl = pl.from_arrow(ways_df)
+    if not isinstance(ways_pl, pl.DataFrame):
+        ways_pl = pl.DataFrame(ways_pl)
+    tag_cols = [c for c in ways_pl.columns if c not in ("osmid", "refs")]
     oneway_values = {"yes", "true", "1", "-1", "reverse", "T", "F"}
     reversed_values = {"-1", "reverse", "T"}
 
     all_edges_forward: list[tuple[int, int, dict[str, Any]]] = []
     all_edges_reverse: list[tuple[int, int, dict[str, Any]]] = []
 
-    # extract columns as numpy arrays for fast access
-    osmid_arr = ways_df["osmid"].to_numpy()
-    refs_arr = ways_df["refs"].to_numpy()
-    tag_arrays = {col: ways_df[col].to_numpy() for col in tag_cols}
+    osmid_arr = ways_pl.get_column("osmid").to_numpy()
+    refs_arr = ways_pl.get_column("refs").to_list()
+    tag_arrays = {col: ways_pl.get_column(col).to_list() for col in tag_cols}
 
-    msg = f"Creating graph from {len(nodes_df):,} OSM nodes and {len(ways_df):,} OSM ways..."
+    msg = (
+        f"Creating graph from {nodes_pl.height:,} OSM nodes and {ways_pl.height:,} OSM ways..."
+    )
     utils.log(msg, level=lg.INFO)
 
-    for i in range(len(ways_df)):
+    for i in range(ways_pl.height):
         fwd, rev = _build_way_edges(
             i, osmid_arr, refs_arr, tag_arrays, tag_cols,
             bidirectional, oneway_values, reversed_values,
@@ -707,7 +715,7 @@ def _create_graph_from_dfs(
 
 
 def _build_rx_edges(
-    ways_df: pd.DataFrame,
+    ways_df: pl.DataFrame,
     osm_to_rx: dict[int, int],
     bidirectional: bool,  # noqa: FBT001
 ) -> list[tuple[int, int, dict[str, Any]]]:
@@ -734,15 +742,15 @@ def _build_rx_edges(
 
     edge_list: list[tuple[int, int, dict[str, Any]]] = []
 
-    for row in ways_df.itertuples(index=False):
-        attrs: dict[str, Any] = {"osmid": row.osmid}
+    for row in ways_df.iter_rows(named=True):
+        attrs: dict[str, Any] = {"osmid": row["osmid"]}
         for col in tag_cols:
-            val = getattr(row, col)
-            if val is not None and not (isinstance(val, float) and pd.isna(val)):
+            val = row[col]
+            if val is not None and not (isinstance(val, float) and math.isnan(val)):
                 attrs[col] = val
 
         # Deduplicate consecutive nodes
-        raw_refs = row.refs
+        raw_refs = row["refs"]
         nodes = [raw_refs[0]]
         for j in range(1, len(raw_refs)):
             if raw_refs[j] != raw_refs[j - 1]:
@@ -776,8 +784,8 @@ def _build_rx_edges(
 
 
 def _create_graph_rustworkx(
-    nodes_df: pd.DataFrame,
-    ways_df: pd.DataFrame,
+    nodes_df: pa.Table,
+    ways_df: pa.Table,
     bidirectional: bool,  # noqa: FBT001
 ) -> Any:  # noqa: ANN401
     """
@@ -810,29 +818,31 @@ def _create_graph_rustworkx(
             "created_date": utils.ts(),
             "created_with": f"ducknx {metadata_version('ducknx')}",
             "crs": settings.default_crs,
-        }
+        },
     )
 
-    # Convert Arrow tables to pandas if needed
-    if isinstance(nodes_df, pa.Table):
-        nodes_df = nodes_df.to_pandas()
-    if isinstance(ways_df, pa.Table):
-        ways_df = ways_df.to_pandas()
+    nodes_pl = pl.from_arrow(nodes_df)
+    if not isinstance(nodes_pl, pl.DataFrame):
+        nodes_pl = pl.DataFrame(nodes_pl)
+    drop_cols = [c for c in nodes_pl.columns
+                 if nodes_pl.get_column(c).null_count() == nodes_pl.height]
+    if drop_cols:
+        nodes_pl = nodes_pl.drop(drop_cols)
 
-    # Add nodes -- build payload dicts and track OSM ID -> rx index mapping
-    nodes_df = nodes_df.set_index("id")
-    nodes_df = nodes_df.dropna(axis="columns", how="all")
-    node_payloads = _build_node_payloads(nodes_df)
+    ways_pl = pl.from_arrow(ways_df)
+    if not isinstance(ways_pl, pl.DataFrame):
+        ways_pl = pl.DataFrame(ways_pl)
+
+    osm_ids = nodes_pl.get_column("id").to_list()
+    node_payloads = _build_node_payloads(nodes_pl)
 
     rx_indices = G.add_nodes_from(node_payloads)
-    osm_to_rx = {int(osm_id): rx_indices[i] for i, osm_id in enumerate(nodes_df.index)}
+    osm_to_rx = {int(osm_id): rx_indices[i] for i, osm_id in enumerate(osm_ids)}
 
-    # Store reverse mapping as graph attribute
-    node_id_map = {rx_indices[i]: int(osm_id) for i, osm_id in enumerate(nodes_df.index)}
+    node_id_map = {rx_indices[i]: int(osm_id) for i, osm_id in enumerate(osm_ids)}
     G.attrs["node_id_map"] = node_id_map
 
-    # Add edges in bulk
-    edge_list = _build_rx_edges(ways_df, osm_to_rx, bidirectional)
+    edge_list = _build_rx_edges(ways_pl, osm_to_rx, bidirectional)
     G.add_edges_from(edge_list)
 
     msg = f"Created rustworkx graph with {G.num_nodes():,} nodes and {G.num_edges():,} edges"
@@ -841,27 +851,31 @@ def _create_graph_rustworkx(
     return G
 
 
-def _build_node_payloads(nodes_df: pd.DataFrame) -> list[dict[str, Any]]:
+def _build_node_payloads(nodes_df: pl.DataFrame) -> list[dict[str, Any]]:
     """
-    Build node payload dicts from a nodes DataFrame indexed by OSM ID.
+    Build per-node payload dicts from a polars DataFrame.
+
+    The DataFrame must contain an ``id`` column (OSM node ID) plus any
+    tag columns. Null tag values are dropped from each payload.
 
     Parameters
     ----------
     nodes_df
-        DataFrame indexed by OSM node ID with columns like y, x, and tags.
+        Polars DataFrame of nodes.
 
     Returns
     -------
     payloads
         List of node attribute dicts, each containing ``osmid``.
     """
-    node_cols = list(nodes_df.columns)
-    payloads = []
-    for osm_id, row in nodes_df.iterrows():
+    payloads: list[dict[str, Any]] = []
+    for row in nodes_df.iter_rows(named=True):
+        osm_id = row["id"]
         payload: dict[str, Any] = {"osmid": int(osm_id)}
-        for col in node_cols:
-            val = row[col]
-            if val is not None and not (isinstance(val, float) and pd.isna(val)):
+        for col, val in row.items():
+            if col == "id":
+                continue
+            if val is not None and not (isinstance(val, float) and math.isnan(val)):
                 payload[col] = val
         payloads.append(payload)
     return payloads
