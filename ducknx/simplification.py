@@ -833,6 +833,13 @@ def simplify_graph(  # noqa: C901, PLR0912
     simplified edges can receive a `merged_edges` attribute that contains a
     list of all the `(u, v)` node pairs that were merged together.
 
+    .. warning::
+        **Breaking change in this release:** ``simplify_graph`` now mutates
+        the input graph ``G`` in place and returns the same object (no longer
+        ``G.copy()`` upfront). If you need the original graph preserved for
+        pre/post comparison, plotting, or stats, pass ``G.copy()`` yourself.
+        This was changed to cut peak memory roughly in half on large graphs.
+
     Use the `node_attrs_include` or `edge_attrs_differ` parameters to relax
     simplification strictness. For example, `edge_attrs_differ=["osmid"]` will
     retain every node whose incident edges have different OSM IDs. This lets
@@ -846,7 +853,8 @@ def simplify_graph(  # noqa: C901, PLR0912
     Parameters
     ----------
     G
-        Input graph.
+        Input graph. **Mutated in place.** Pass ``G.copy()`` if you need
+        the original preserved.
     node_attrs_include
         Node attribute names for relaxing the strictness of endpoint
         determination. A node is always an endpoint if it possesses one or
@@ -873,8 +881,8 @@ def simplify_graph(  # noqa: C901, PLR0912
     Returns
     -------
     Gs
-        Topologically simplified graph, with a new `geometry` attribute on
-        each simplified edge.
+        The same object as ``G``, now topologically simplified, with a new
+        `geometry` attribute on each simplified edge.
     """
     if G.graph.get("simplified"):  # pragma: no cover
         msg = "This graph has already been simplified, cannot simplify it again."
@@ -1214,9 +1222,13 @@ def _split_disconnected_clusters(
         .agg(pl.col("osmid"))
     )
 
-    # Walk per cluster (small list) computing WCC splits.
+    # Walk per cluster (small list) computing WCC splits. Track which new
+    # labels were produced by a true split so we only recompute their
+    # centroid coordinates — non-split clusters keep the polygon-centroid
+    # x/y from the incoming cluster_df (preserving legacy semantics).
     new_label = 0
     osmid_to_new: dict[int, int] = {}
+    split_labels: set[int] = set()
     for osmids in grouped.get_column("osmid").to_list():
         if len(osmids) == 1:
             osmid_to_new[int(osmids[0])] = new_label
@@ -1231,6 +1243,7 @@ def _split_disconnected_clusters(
             for wcc in wccs:
                 for o in wcc:
                     osmid_to_new[int(o)] = new_label
+                split_labels.add(new_label)
                 new_label += 1
 
     relabel = pl.DataFrame(
@@ -1246,16 +1259,27 @@ def _split_disconnected_clusters(
         .rename({"new_cluster": "cluster"})
     )
 
-    # Recompute centroids in a single group_by + join (no per-cluster Python loop).
-    centroids = (
-        out.group_by("cluster")
-        .agg(pl.col("x").mean().alias("cx"), pl.col("y").mean().alias("cy"))
-    )
-    out = (
-        out.join(centroids, on="cluster", how="left")
-        .with_columns(pl.col("cx").alias("x"), pl.col("cy").alias("y"))
-        .drop("cx", "cy")
-    )
+    if split_labels:
+        # Compute per-cluster node-centroid only for clusters that were split.
+        centroids = (
+            out.filter(pl.col("cluster").is_in(list(split_labels)))
+            .group_by("cluster")
+            .agg(pl.col("x").mean().alias("cx"), pl.col("y").mean().alias("cy"))
+        )
+        out = (
+            out.join(centroids, on="cluster", how="left")
+            .with_columns(
+                pl.when(pl.col("cx").is_not_null())
+                  .then(pl.col("cx"))
+                  .otherwise(pl.col("x"))
+                  .alias("x"),
+                pl.when(pl.col("cy").is_not_null())
+                  .then(pl.col("cy"))
+                  .otherwise(pl.col("y"))
+                  .alias("y"),
+            )
+            .drop("cx", "cy")
+        )
     return out.select(["osmid", "x", "y", "cluster"])
 
 

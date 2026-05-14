@@ -19,6 +19,13 @@ def main() -> None:
     """Print before/after and emit Phase A gate / Phase B trigger verdict."""
     root = Path(__file__).parent / "results"
     base = json.loads((root / "baseline.json").read_text())
+    if base.get("source") == "spec_estimate":
+        print(
+            "WARNING: benchmarks/results/baseline.json is seeded from spec "
+            "estimates, not a measured pre-Phase-A run. Re-baseline after "
+            "Phase B lands for trustworthy comparisons.",
+            file=sys.stderr,
+        )
     new_path = root / f"{latest_sha()}.json"
     if not new_path.exists():
         print(f"No benchmark JSON at {new_path}", file=sys.stderr)
