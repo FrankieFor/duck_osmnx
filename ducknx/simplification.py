@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging as lg
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -21,6 +22,132 @@ from ._errors import GraphSimplificationError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+
+@dataclass(frozen=True)
+class AdjacencyView:
+    """
+    Read-only CSR snapshot of a MultiDiGraph for vectorized topology work.
+
+    Parameters
+    ----------
+    node_ids
+        Sorted int64 array of OSM node IDs (the row order for all per-node arrays).
+    osmid_to_idx
+        Mapping from OSM node ID to row index in ``node_ids``.
+    succ_indptr
+        CSR successor pointer array (length ``n + 1``).
+    succ_indices
+        CSR successor row-index array.
+    pred_indptr
+        CSR predecessor pointer array (length ``n + 1``).
+    pred_indices
+        CSR predecessor row-index array.
+    xs
+        Per-node x coordinate array.
+    ys
+        Per-node y coordinate array.
+    out_degree
+        Per-node out-degree (parallel edges counted).
+    in_degree
+        Per-node in-degree (parallel edges counted).
+    """
+
+    node_ids: np.ndarray
+    osmid_to_idx: dict[int, int]
+    succ_indptr: np.ndarray
+    succ_indices: np.ndarray
+    pred_indptr: np.ndarray
+    pred_indices: np.ndarray
+    xs: np.ndarray
+    ys: np.ndarray
+    out_degree: np.ndarray
+    in_degree: np.ndarray
+
+
+def _build_adjacency(G: nx.MultiDiGraph) -> AdjacencyView:
+    """
+    Build a CSR adjacency snapshot from a MultiDiGraph.
+
+    Uses ``G.adj`` and ``G.pred`` directly to avoid per-node Python method
+    calls. Multi-edges between the same ``(u, v)`` contribute one CSR entry
+    per parallel edge so endpoint rule 3 (degree 4 = parallel-edge case)
+    sees the same shape as NetworkX would report.
+
+    Parameters
+    ----------
+    G
+        Input MultiDiGraph.
+
+    Returns
+    -------
+    adj
+        Frozen ``AdjacencyView`` snapshot.
+    """
+    n = G.number_of_nodes()
+    node_ids = np.fromiter(sorted(G.nodes), dtype=np.int64, count=n)
+    osmid_to_idx = {int(nid): i for i, nid in enumerate(node_ids)}
+
+    succ_counts = np.zeros(n, dtype=np.int64)
+    pred_counts = np.zeros(n, dtype=np.int64)
+
+    adj = G.adj
+    pred = G.pred
+    for u, succs in adj.items():
+        ui = osmid_to_idx[u]
+        for _v, ekeys in succs.items():
+            succ_counts[ui] += len(ekeys)
+    for v, preds in pred.items():
+        vi = osmid_to_idx[v]
+        for _u, ekeys in preds.items():
+            pred_counts[vi] += len(ekeys)
+
+    succ_indptr = np.empty(n + 1, dtype=np.int64)
+    pred_indptr = np.empty(n + 1, dtype=np.int64)
+    succ_indptr[0] = 0
+    pred_indptr[0] = 0
+    np.cumsum(succ_counts, out=succ_indptr[1:])
+    np.cumsum(pred_counts, out=pred_indptr[1:])
+
+    succ_indices = np.empty(int(succ_indptr[-1]), dtype=np.int64)
+    pred_indices = np.empty(int(pred_indptr[-1]), dtype=np.int64)
+
+    succ_cursor = succ_indptr[:-1].copy()
+    pred_cursor = pred_indptr[:-1].copy()
+    for u, succs in adj.items():
+        ui = osmid_to_idx[u]
+        for v, ekeys in succs.items():
+            vi = osmid_to_idx[v]
+            for _ in ekeys:
+                succ_indices[succ_cursor[ui]] = vi
+                succ_cursor[ui] += 1
+    for v, preds in pred.items():
+        vi = osmid_to_idx[v]
+        for u, ekeys in preds.items():
+            ui = osmid_to_idx[u]
+            for _ in ekeys:
+                pred_indices[pred_cursor[vi]] = ui
+                pred_cursor[vi] += 1
+
+    xs = np.fromiter(
+        (G.nodes[int(nid)]["x"] for nid in node_ids), dtype=np.float64, count=n,
+    )
+    ys = np.fromiter(
+        (G.nodes[int(nid)]["y"] for nid in node_ids), dtype=np.float64, count=n,
+    )
+
+    return AdjacencyView(
+        node_ids=node_ids,
+        osmid_to_idx=osmid_to_idx,
+        succ_indptr=succ_indptr,
+        succ_indices=succ_indices,
+        pred_indptr=pred_indptr,
+        pred_indices=pred_indices,
+        xs=xs,
+        ys=ys,
+        out_degree=succ_counts,
+        in_degree=pred_counts,
+    )
 
 
 def _is_endpoint(
@@ -302,6 +429,382 @@ def _remove_rings(
     return G
 
 
+def _identify_endpoints_vectorized(
+    G: nx.MultiDiGraph,
+    adj: AdjacencyView,
+    node_attrs_include: Iterable[str] | None,
+    edge_attrs_differ: Iterable[str] | None,
+) -> set[int]:
+    """
+    Vectorized endpoint detection over a CSR adjacency snapshot.
+
+    Rules 1-3 (self-loop, dangling, neighbor/degree mismatch) are evaluated
+    as numpy operations on flat CSR arrays. Rules 4-5 fall back to per-node
+    checks but only for nodes that survived rules 1-3.
+
+    Parameters
+    ----------
+    G
+        Input graph (used for attribute access in rules 4-5).
+    adj
+        CSR adjacency snapshot.
+    node_attrs_include
+        Same semantics as ``_identify_endpoints``.
+    edge_attrs_differ
+        Same semantics as ``_identify_endpoints``.
+
+    Returns
+    -------
+    endpoints
+        Set of OSM node IDs that are endpoints.
+    """
+    n = adj.node_ids.size
+    is_endpoint = np.zeros(n, dtype=bool)
+
+    # Per-edge source index for each CSR successor / predecessor entry.
+    src_succ = np.repeat(np.arange(n, dtype=np.int64), np.diff(adj.succ_indptr))
+    src_pred = np.repeat(np.arange(n, dtype=np.int64), np.diff(adj.pred_indptr))
+
+    # Rule 1: self-loops
+    self_loop_mask = src_succ == adj.succ_indices
+    is_endpoint[src_succ[self_loop_mask]] = True
+
+    # Rule 2: zero in/out degree
+    is_endpoint |= (adj.in_degree == 0) | (adj.out_degree == 0)
+
+    # Rule 3: unique-neighbor count + degree check (vectorized)
+    all_src = np.concatenate([src_succ, src_pred])
+    all_nbr = np.concatenate([adj.succ_indices, adj.pred_indices])
+    if all_src.size > 0:
+        order = np.lexsort((all_nbr, all_src))
+        s_sorted = all_src[order]
+        n_sorted = all_nbr[order]
+        first = np.empty(s_sorted.size, dtype=bool)
+        first[0] = True
+        first[1:] = (s_sorted[1:] != s_sorted[:-1]) | (n_sorted[1:] != n_sorted[:-1])
+        unique_counts = np.bincount(s_sorted[first], minlength=n).astype(np.int64)
+    else:
+        unique_counts = np.zeros(n, dtype=np.int64)
+    degree = adj.in_degree + adj.out_degree
+    rule3_pass = (unique_counts == 2) & ((degree == 2) | (degree == 4))  # noqa: PLR2004
+    is_endpoint |= ~rule3_pass
+
+    # Rules 4-5: per-node fallback only for survivors
+    if node_attrs_include is not None or edge_attrs_differ is not None:
+        attrs_set = set(node_attrs_include) if node_attrs_include is not None else None
+        edge_attrs_list = list(edge_attrs_differ) if edge_attrs_differ is not None else None
+        survivors = np.where(~is_endpoint)[0]
+        for i in survivors:
+            osmid = int(adj.node_ids[i])
+            if attrs_set is not None and len(attrs_set & G.nodes[osmid].keys()) > 0:
+                is_endpoint[i] = True
+                continue
+            if edge_attrs_list is not None:
+                hit = False
+                for attr in edge_attrs_list:
+                    in_values = {v for _, _, v in G.in_edges(osmid, data=attr, keys=False)}
+                    out_values = {v for _, _, v in G.out_edges(osmid, data=attr, keys=False)}
+                    if len(in_values | out_values) > 1:
+                        hit = True
+                        break
+                if hit:
+                    is_endpoint[i] = True
+
+    return {int(adj.node_ids[i]) for i in np.where(is_endpoint)[0]}
+
+
+def _trace_paths(
+    adj: AdjacencyView,
+    endpoints: set[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Trace simplification paths between endpoint nodes via CSR DFS.
+
+    Mirrors the semantics of ``_build_path`` but operates on integer indices
+    into ``adj.node_ids`` and emits flat ``(offsets, nodes_flat)`` arrays.
+
+    Parameters
+    ----------
+    adj
+        CSR adjacency snapshot.
+    endpoints
+        Set of endpoint OSM node IDs.
+
+    Returns
+    -------
+    offsets
+        Int64 array; path ``i`` spans ``nodes_flat[offsets[i]:offsets[i+1]]``.
+    nodes_flat
+        Int64 array of row indices into ``adj.node_ids``.
+    """
+    is_endpoint = np.zeros(adj.node_ids.size, dtype=bool)
+    for e in endpoints:
+        is_endpoint[adj.osmid_to_idx[e]] = True
+
+    endpoint_idxs = sorted(adj.osmid_to_idx[e] for e in endpoints)
+
+    paths_offsets: list[int] = [0]
+    paths_nodes: list[int] = []
+
+    for ei in endpoint_idxs:
+        s, e = adj.succ_indptr[ei], adj.succ_indptr[ei + 1]
+        # collect unique successors only (parallel multi-edges duplicate)
+        seen_succs: set[int] = set()
+        for succ_val in adj.succ_indices[s:e]:
+            succ = int(succ_val)
+            if succ in seen_succs:
+                continue
+            seen_succs.add(succ)
+            if is_endpoint[succ]:
+                continue
+
+            path = [ei, succ]
+            path_set = {ei, succ}
+
+            ss, se = adj.succ_indptr[succ], adj.succ_indptr[succ + 1]
+            picked: int | None = None
+            for nxt in adj.succ_indices[ss:se]:
+                nxti = int(nxt)
+                if nxti not in path_set:
+                    picked = nxti
+                    break
+            if picked is None:
+                paths_nodes.extend(path)
+                paths_offsets.append(len(paths_nodes))
+                continue
+
+            path.append(picked)
+            path_set.add(picked)
+
+            current = picked
+            while not is_endpoint[current]:
+                cs, ce = adj.succ_indptr[current], adj.succ_indptr[current + 1]
+                onward = [int(x) for x in adj.succ_indices[cs:ce] if int(x) not in path_set]
+                if len(onward) == 1:
+                    current = onward[0]
+                    path.append(current)
+                    path_set.add(current)
+                elif not onward:
+                    cs2, ce2 = adj.succ_indptr[current], adj.succ_indptr[current + 1]
+                    if ei in adj.succ_indices[cs2:ce2]:
+                        path.append(ei)
+                    break
+                else:  # pragma: no cover
+                    msg = f"Impossible simplify pattern at node idx {current}"
+                    raise GraphSimplificationError(msg)
+
+            paths_nodes.extend(path)
+            paths_offsets.append(len(paths_nodes))
+
+    return (
+        np.asarray(paths_offsets, dtype=np.int64),
+        np.asarray(paths_nodes, dtype=np.int64),
+    )
+
+
+def _build_path_geometries(
+    offsets: np.ndarray,
+    nodes_flat: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+) -> np.ndarray:
+    """
+    Bulk-build LineString geometries for every path in one shapely call.
+
+    Parameters
+    ----------
+    offsets
+        Path offsets (int64), length ``num_paths + 1``.
+    nodes_flat
+        Flat array of node indices into ``xs``/``ys``.
+    xs
+        X coordinate array aligned with ``adj.node_ids``.
+    ys
+        Y coordinate array aligned with ``adj.node_ids``.
+
+    Returns
+    -------
+    geoms
+        Numpy object array of shapely LineStrings, one per path.
+    """
+    if nodes_flat.size == 0:
+        return np.empty(0, dtype=object)
+    coords = np.empty((nodes_flat.size, 2), dtype=np.float64)
+    coords[:, 0] = xs[nodes_flat]
+    coords[:, 1] = ys[nodes_flat]
+    line_idx = np.repeat(
+        np.arange(offsets.size - 1, dtype=np.int64),
+        np.diff(offsets),
+    )
+    return shapely.linestrings(coords, indices=line_idx)
+
+
+def _aggregate_path_attrs(
+    G: nx.MultiDiGraph,
+    path_osmids: list[int],
+    edge_attr_aggs: dict[str, Any],
+    *,
+    track_merged: bool,
+) -> tuple[dict[str, Any], list[tuple[int, int]]]:
+    """
+    Aggregate attrs across the edges of a single simplification path.
+
+    Parameters
+    ----------
+    G
+        Input graph.
+    path_osmids
+        OSM node IDs along the path, in order.
+    edge_attr_aggs
+        Aggregation function map (matches ``simplify_graph``'s arg).
+    track_merged
+        Whether to record the per-segment ``(u, v)`` pairs.
+
+    Returns
+    -------
+    attrs
+        Aggregated attribute dict.
+    merged
+        Per-segment ``(u, v)`` pairs (empty if ``track_merged`` is False).
+    """
+    path_attrs: dict[str, list[Any]] = {}
+    merged: list[tuple[int, int]] = []
+    for u, v in zip(path_osmids[:-1], path_osmids[1:], strict=True):
+        if track_merged:
+            merged.append((u, v))
+        edge_count = G.number_of_edges(u, v)
+        if edge_count != 1:
+            msg = f"Found {edge_count} edges between {u} and {v} when simplifying"
+            utils.log(msg, level=lg.WARNING)
+        edge_data = next(iter(G.get_edge_data(u, v).values()))
+        for key, val in edge_data.items():
+            path_attrs.setdefault(key, []).append(val)
+
+    out: dict[str, Any] = {}
+    for key, values in path_attrs.items():
+        if key in edge_attr_aggs:
+            out[key] = edge_attr_aggs[key](values)
+            continue
+        # Use an order-preserving dedup that tolerates unhashable values
+        # (list-valued attrs from prior simplification merges).
+        uniq: list[Any] = []
+        for v in values:
+            if v not in uniq:
+                uniq.append(v)
+        out[key] = uniq[0] if len(uniq) == 1 else uniq
+    return out, merged
+
+
+def _simplify_graph_legacy(  # noqa: C901, PLR0912
+    G: nx.MultiDiGraph,
+    *,
+    node_attrs_include: Iterable[str] | None = None,
+    edge_attrs_differ: Iterable[str] | None = None,
+    remove_rings: bool = True,
+    track_merged: bool = False,
+    edge_attr_aggs: dict[str, Any] | None = None,
+) -> nx.MultiDiGraph:
+    """
+    Reference (legacy) implementation kept for equivalence testing only.
+
+    Identical to the pre-Phase-A ``simplify_graph``. Do not call from
+    production code paths; it exists solely as an oracle for the
+    equivalence test suite during the Phase A rollout.
+
+    Parameters
+    ----------
+    G
+        Input graph.
+    node_attrs_include
+        Same semantics as ``simplify_graph``.
+    edge_attrs_differ
+        Same semantics as ``simplify_graph``.
+    remove_rings
+        Same semantics as ``simplify_graph``.
+    track_merged
+        Same semantics as ``simplify_graph``.
+    edge_attr_aggs
+        Same semantics as ``simplify_graph``.
+
+    Returns
+    -------
+    Gs
+        Topologically simplified graph.
+    """
+    if G.graph.get("simplified"):  # pragma: no cover
+        msg = "This graph has already been simplified, cannot simplify it again."
+        raise GraphSimplificationError(msg)
+
+    if edge_attr_aggs is None:
+        edge_attr_aggs = {"length": sum, "travel_time": sum}
+
+    G = G.copy()
+    initial_node_count = len(G)
+    initial_edge_count = len(G.edges)
+    all_nodes_to_remove: list[int] = []
+    all_edges_to_add: list[dict[str, Any]] = []
+
+    paths, endpoints = _get_paths_to_simplify(G, node_attrs_include, edge_attrs_differ)
+    for path in paths:
+        merged_edges: list[tuple[int, int]] = []
+        path_attributes: dict[str, Any] = {}
+        for u, v in zip(path[:-1], path[1:]):
+            if track_merged:
+                merged_edges.append((u, v))
+            edge_count = G.number_of_edges(u, v)
+            if edge_count != 1:
+                msg = f"Found {edge_count} edges between {u} and {v} when simplifying"
+                utils.log(msg, level=lg.WARNING)
+            edge_data = next(iter(G.get_edge_data(u, v).values()))
+            for attr in edge_data:
+                if attr in path_attributes:
+                    path_attributes[attr].append(edge_data[attr])
+                else:
+                    path_attributes[attr] = [edge_data[attr]]
+
+        for attr_name, attr_values in path_attributes.items():
+            if attr_name in edge_attr_aggs:
+                path_attributes[attr_name] = edge_attr_aggs[attr_name](attr_values)
+            elif len({type(x).__name__ + repr(x) for x in attr_values}) == 1:
+                path_attributes[attr_name] = attr_values[0]
+            else:
+                # Use order-preserving dedup tolerating unhashable values.
+                uniq: list[Any] = []
+                for x in attr_values:
+                    if x not in uniq:
+                        uniq.append(x)
+                path_attributes[attr_name] = uniq[0] if len(uniq) == 1 else uniq
+
+        path_attributes["geometry"] = LineString(
+            [Point((G.nodes[node]["x"], G.nodes[node]["y"])) for node in path],
+        )
+
+        if track_merged:
+            path_attributes["merged_edges"] = merged_edges
+
+        all_nodes_to_remove.extend(path[1:-1])
+        all_edges_to_add.append(
+            {"origin": path[0], "destination": path[-1], "attr_dict": path_attributes},
+        )
+
+    for edge in all_edges_to_add:
+        G.add_edge(edge["origin"], edge["destination"], **edge["attr_dict"])
+
+    G.remove_nodes_from(set(all_nodes_to_remove))
+
+    if remove_rings:
+        G = _remove_rings(G, endpoints)
+
+    G.graph["simplified"] = True
+
+    msg = (
+        f"Simplified graph: {initial_node_count:,} to {len(G):,} nodes, "
+        f"{initial_edge_count:,} to {len(G.edges):,} edges"
+    )
+    utils.log(msg, level=lg.INFO)
+    return G
+
+
 def simplify_graph(  # noqa: C901, PLR0912
     G: nx.MultiDiGraph,
     *,
@@ -330,6 +833,13 @@ def simplify_graph(  # noqa: C901, PLR0912
     simplified edges can receive a `merged_edges` attribute that contains a
     list of all the `(u, v)` node pairs that were merged together.
 
+    .. warning::
+        **Breaking change in this release:** ``simplify_graph`` now mutates
+        the input graph ``G`` in place and returns the same object (no longer
+        ``G.copy()`` upfront). If you need the original graph preserved for
+        pre/post comparison, plotting, or stats, pass ``G.copy()`` yourself.
+        This was changed to cut peak memory roughly in half on large graphs.
+
     Use the `node_attrs_include` or `edge_attrs_differ` parameters to relax
     simplification strictness. For example, `edge_attrs_differ=["osmid"]` will
     retain every node whose incident edges have different OSM IDs. This lets
@@ -343,7 +853,8 @@ def simplify_graph(  # noqa: C901, PLR0912
     Parameters
     ----------
     G
-        Input graph.
+        Input graph. **Mutated in place.** Pass ``G.copy()`` if you need
+        the original preserved.
     node_attrs_include
         Node attribute names for relaxing the strictness of endpoint
         determination. A node is always an endpoint if it possesses one or
@@ -370,105 +881,56 @@ def simplify_graph(  # noqa: C901, PLR0912
     Returns
     -------
     Gs
-        Topologically simplified graph, with a new `geometry` attribute on
-        each simplified edge.
+        The same object as ``G``, now topologically simplified, with a new
+        `geometry` attribute on each simplified edge.
     """
     if G.graph.get("simplified"):  # pragma: no cover
         msg = "This graph has already been simplified, cannot simplify it again."
         raise GraphSimplificationError(msg)
 
-    msg = "Begin topologically simplifying the graph..."
+    msg = "Begin topologically simplifying the graph (vectorized)..."
     utils.log(msg, level=lg.INFO)
 
-    # default edge segment attributes to aggregate upon simplification
     if edge_attr_aggs is None:
         edge_attr_aggs = {"length": sum, "travel_time": sum}
 
-    # make a copy to not mutate original graph object caller passed in
-    G = G.copy()
     initial_node_count = len(G)
     initial_edge_count = len(G.edges)
-    all_nodes_to_remove = []
-    all_edges_to_add = []
 
-    # generate each path that needs to be simplified
-    paths, endpoints = _get_paths_to_simplify(G, node_attrs_include, edge_attrs_differ)
-    for path in paths:
-        # add the interstitial edges we're removing to a list so we can retain
-        # their spatial geometry
-        merged_edges = []
-        path_attributes: dict[str, Any] = {}
-        for u, v in zip(path[:-1], path[1:]):
-            if track_merged:
-                # keep track of the edges that were merged
-                merged_edges.append((u, v))
+    adj = _build_adjacency(G)
+    endpoints = _identify_endpoints_vectorized(
+        G, adj, node_attrs_include, edge_attrs_differ,
+    )
+    msg = f"Identified {len(endpoints):,} edge endpoints"
+    utils.log(msg, level=lg.INFO)
 
-            # there should rarely be multiple edges between interstitial nodes
-            # usually happens if OSM has duplicate ways digitized for just one
-            # street... we will keep only one of the edges (see below)
-            edge_count = G.number_of_edges(u, v)
-            if edge_count != 1:
-                msg = f"Found {edge_count} edges between {u} and {v} when simplifying"
-                utils.log(msg, level=lg.WARNING)
+    offsets, nodes_flat = _trace_paths(adj, endpoints)
+    geometries = _build_path_geometries(offsets, nodes_flat, adj.xs, adj.ys)
 
-            # get edge between these nodes: if multiple edges exist between
-            # them (see above), we retain only one in the simplified graph
-            # We can't assume that there exists an edge from u to v
-            # with key=0, so we get a list of all edges from u to v
-            # and just take the first one.
-            edge_data = next(iter(G.get_edge_data(u, v).values()))
-            for attr in edge_data:
-                if attr in path_attributes:
-                    # if this key already exists in the dict, append it to the
-                    # value list
-                    path_attributes[attr].append(edge_data[attr])
-                else:
-                    # if this key doesn't already exist, set the value to a list
-                    # containing the one value
-                    path_attributes[attr] = [edge_data[attr]]
+    nodes_to_remove: list[int] = []
+    edges_to_add: list[tuple[int, int, dict[str, Any]]] = []
 
-        # consolidate the path's edge segments' attribute values
-        for attr_name, attr_values in path_attributes.items():
-            if attr_name in edge_attr_aggs:
-                # if this attribute's values must be aggregated, do so now
-                agg_func = edge_attr_aggs[attr_name]
-                path_attributes[attr_name] = agg_func(attr_values)
-            elif len(set(attr_values)) == 1:
-                # if there's only 1 unique value, keep that single value
-                path_attributes[attr_name] = attr_values[0]
-            else:
-                # otherwise, if there are multiple uniques, keep one of each
-                path_attributes[attr_name] = list(dict.fromkeys(attr_values))
-
-        # construct the new consolidated edge's geometry for this path
-        path_attributes["geometry"] = LineString(
-            [Point((G.nodes[node]["x"], G.nodes[node]["y"])) for node in path],
+    for i in range(offsets.size - 1):
+        path_idxs = nodes_flat[offsets[i]: offsets[i + 1]]
+        path_osmids = [int(adj.node_ids[idx]) for idx in path_idxs]
+        attrs, merged = _aggregate_path_attrs(
+            G, path_osmids, edge_attr_aggs, track_merged=track_merged,
         )
-
+        attrs["geometry"] = geometries[i]
         if track_merged:
-            # add the merged edges as a new attribute of the simplified edge
-            path_attributes["merged_edges"] = merged_edges
+            attrs["merged_edges"] = merged
 
-        # add the nodes and edge to their lists for processing at the end
-        all_nodes_to_remove.extend(path[1:-1])
-        all_edges_to_add.append(
-            {"origin": path[0], "destination": path[-1], "attr_dict": path_attributes},
-        )
+        nodes_to_remove.extend(path_osmids[1:-1])
+        edges_to_add.append((path_osmids[0], path_osmids[-1], attrs))
 
-    # for each edge to add in the list we assembled, create a new edge between
-    # the origin and destination
-    for edge in all_edges_to_add:
-        G.add_edge(edge["origin"], edge["destination"], **edge["attr_dict"])
-
-    # finally remove all the interstitial nodes between the new edges
-    G.remove_nodes_from(set(all_nodes_to_remove))
+    for u, v, data in edges_to_add:
+        G.add_edge(u, v, **data)
+    G.remove_nodes_from(set(nodes_to_remove))
 
     if remove_rings:
         G = _remove_rings(G, endpoints)
 
-    # mark the graph as having been simplified
     G.graph["simplified"] = True
-
     msg = (
         f"Simplified graph: {initial_node_count:,} to {len(G):,} nodes, "
         f"{initial_edge_count:,} to {len(G.edges):,} edges"
@@ -735,64 +1197,90 @@ def _split_disconnected_clusters(
     G: nx.MultiDiGraph,
 ) -> pl.DataFrame:
     """
-    Split disconnected clusters into connected subclusters.
+    Split disconnected clusters into connected subclusters (polars-native).
 
     If a cluster contains multiple weakly connected components, move each
-    component to its own subcluster to avoid connecting nodes that are not
-    truly connected (e.g., nearby dead-ends or surface streets with bridge).
+    component to its own subcluster so we don't fuse topologically
+    disconnected nodes (e.g. surface streets that visually overlap a bridge).
 
     Parameters
     ----------
-    gdf
-        Node-to-cluster mapping GeoDataFrame.
-    node_points
-        Original graph's node points GeoDataFrame.
+    cluster_df
+        Polars DataFrame with columns ``osmid``, ``x``, ``y``, ``cluster``.
     G
         The original projected graph.
 
     Returns
     -------
-    cluster_df
-        Polars DataFrame (`osmid`, `x`, `y`, `cluster`) with disconnected
-        clusters split into subclusters and unique integer cluster IDs.
+    out
+        Polars DataFrame with the same columns; ``cluster`` reassigned to
+        sequential integer IDs of WCC-split clusters, and ``x``/``y`` set to
+        the centroid of each connected subcluster.
     """
-    rows = cluster_df.to_dicts()
-    by_cluster: dict[Any, list[dict[str, Any]]] = {}
-    for row in rows:
-        by_cluster.setdefault(row["cluster"], []).append(row)
+    grouped = (
+        cluster_df.group_by("cluster", maintain_order=True)
+        .agg(pl.col("osmid"))
+    )
 
-    new_label_seq = 0
-    relabeled: list[dict[str, Any]] = []
-    for nodes_subset in by_cluster.values():
-        osmids = [row["osmid"] for row in nodes_subset]
-        if len(osmids) > 1:
-            wccs = list(nx.weakly_connected_components(G.subgraph(osmids)))
-            if len(wccs) > 1:
-                # multiple weakly-connected components in one cluster: split
-                node_to_wcc = {n: idx for idx, wcc in enumerate(wccs) for n in wcc}
-                # group rows by wcc, assign each its own new label + centroid
-                wcc_groups: dict[int, list[dict[str, Any]]] = {}
-                for row in nodes_subset:
-                    wcc_groups.setdefault(node_to_wcc[row["osmid"]], []).append(row)
-                for group in wcc_groups.values():
-                    pts = shapely.points(
-                        np.array([r["x"] for r in group], dtype=np.float64),
-                        np.array([r["y"] for r in group], dtype=np.float64),
-                    )
-                    centroid = shapely.union_all(pts).centroid
-                    for r in group:
-                        r["x"] = float(centroid.x)
-                        r["y"] = float(centroid.y)
-                        r["cluster"] = new_label_seq
-                    new_label_seq += 1
-                    relabeled.extend(group)
-                continue
-        for row in nodes_subset:
-            row["cluster"] = new_label_seq
-        new_label_seq += 1
-        relabeled.extend(nodes_subset)
+    # Walk per cluster (small list) computing WCC splits. Track which new
+    # labels were produced by a true split so we only recompute their
+    # centroid coordinates — non-split clusters keep the polygon-centroid
+    # x/y from the incoming cluster_df (preserving legacy semantics).
+    new_label = 0
+    osmid_to_new: dict[int, int] = {}
+    split_labels: set[int] = set()
+    for osmids in grouped.get_column("osmid").to_list():
+        if len(osmids) == 1:
+            osmid_to_new[int(osmids[0])] = new_label
+            new_label += 1
+            continue
+        wccs = list(nx.weakly_connected_components(G.subgraph(osmids)))
+        if len(wccs) == 1:
+            for o in osmids:
+                osmid_to_new[int(o)] = new_label
+            new_label += 1
+        else:
+            for wcc in wccs:
+                for o in wcc:
+                    osmid_to_new[int(o)] = new_label
+                split_labels.add(new_label)
+                new_label += 1
 
-    return pl.DataFrame(relabeled, schema=cluster_df.schema)
+    relabel = pl.DataFrame(
+        {
+            "osmid": list(osmid_to_new.keys()),
+            "new_cluster": list(osmid_to_new.values()),
+        },
+        schema={"osmid": cluster_df.schema["osmid"], "new_cluster": pl.Int64},
+    )
+    out = (
+        cluster_df.join(relabel, on="osmid", how="left")
+        .drop("cluster")
+        .rename({"new_cluster": "cluster"})
+    )
+
+    if split_labels:
+        # Compute per-cluster node-centroid only for clusters that were split.
+        centroids = (
+            out.filter(pl.col("cluster").is_in(list(split_labels)))
+            .group_by("cluster")
+            .agg(pl.col("x").mean().alias("cx"), pl.col("y").mean().alias("cy"))
+        )
+        out = (
+            out.join(centroids, on="cluster", how="left")
+            .with_columns(
+                pl.when(pl.col("cx").is_not_null())
+                  .then(pl.col("cx"))
+                  .otherwise(pl.col("x"))
+                  .alias("x"),
+                pl.when(pl.col("cy").is_not_null())
+                  .then(pl.col("cy"))
+                  .otherwise(pl.col("y"))
+                  .alias("y"),
+            )
+            .drop("cx", "cy")
+        )
+    return out.select(["osmid", "x", "y", "cluster"])
 
 
 def _aggregate_cluster_attrs(
@@ -878,6 +1366,76 @@ def _named_agg(name: str, values: list[Any]) -> Any:  # noqa: ANN401
     return method()
 
 
+def _aggregate_all_cluster_attrs(
+    cluster_df: pl.DataFrame,
+    G: nx.MultiDiGraph,
+    node_attr_aggs: dict[str, Any],
+) -> dict[int, dict[str, Any]]:
+    """
+    Aggregate node attributes for every cluster in a single pass over G.nodes.
+
+    Parameters
+    ----------
+    cluster_df
+        Polars DataFrame with columns ``osmid``, ``x``, ``y``, ``cluster``.
+    G
+        Source graph supplying node attributes.
+    node_attr_aggs
+        Mapping from attribute name to aggregation function (callable) or
+        polars-named aggregation (string).
+
+    Returns
+    -------
+    out
+        Mapping ``cluster_id -> attrs dict``. Each dict carries
+        ``osmid_original``, ``x``, ``y``, and merged tag attributes.
+    """
+    osmid_col = cluster_df.get_column("osmid").to_list()
+    cluster_col = cluster_df.get_column("cluster").to_list()
+    x_col = cluster_df.get_column("x").to_list()
+    y_col = cluster_df.get_column("y").to_list()
+
+    per_cluster: dict[int, dict[str, list[Any]]] = {}
+    cluster_xy: dict[int, tuple[float, float]] = {}
+    for osmid, cid, x, y in zip(osmid_col, cluster_col, x_col, y_col, strict=True):
+        cid_int = int(cid)
+        bucket = per_cluster.setdefault(cid_int, {"osmid_original": []})
+        bucket["osmid_original"].append(int(osmid))
+        cluster_xy.setdefault(cid_int, (float(x), float(y)))
+        for key, val in G.nodes[int(osmid)].items():
+            if val is None:
+                continue
+            bucket.setdefault(key, []).append(val)
+
+    out: dict[int, dict[str, Any]] = {}
+    for cid, attrs in per_cluster.items():
+        x, y = cluster_xy[cid]
+        merged: dict[str, Any] = {
+            "osmid_original": attrs.pop("osmid_original"),
+            "x": x,
+            "y": y,
+        }
+        for key, values in attrs.items():
+            if key in {"x", "y"}:
+                continue
+            if key in node_attr_aggs:
+                agg = node_attr_aggs[key]
+                try:
+                    merged[key] = agg(values) if callable(agg) else _named_agg(agg, values)
+                except (TypeError, ValueError):
+                    merged[key] = values
+                continue
+            if key == "street_count":
+                continue
+            uniq = list(dict.fromkeys(values))
+            if len(uniq) == 1:
+                merged[key] = uniq[0]
+            elif len(uniq) > 1:
+                merged[key] = uniq
+        out[cid] = merged
+    return out
+
+
 def _build_consolidated_nodes(
     Gc: nx.MultiDiGraph,
     cluster_df: pl.DataFrame,
@@ -886,6 +1444,10 @@ def _build_consolidated_nodes(
 ) -> None:
     """
     Create a new node in ``Gc`` for each cluster in ``cluster_df``.
+
+    Single-pass implementation: walks the cluster table once via
+    ``_aggregate_all_cluster_attrs`` and emits one ``add_node`` call per
+    cluster (instead of looping over per-cluster subsets in Python).
 
     Parameters
     ----------
@@ -898,19 +1460,28 @@ def _build_consolidated_nodes(
     node_attr_aggs
         Node attribute aggregation functions.
     """
-    rows = cluster_df.to_dicts()
-    by_cluster: dict[int, list[dict[str, Any]]] = {}
-    for row in rows:
-        by_cluster.setdefault(row["cluster"], []).append(row)
+    # Identify single-node clusters so we can copy their attrs verbatim.
+    sizes = cluster_df.group_by("cluster").len().rename({"len": "n"})
+    single = sizes.filter(pl.col("n") == 1).get_column("cluster").to_list()
+    single_set = {int(c) for c in single}
 
-    for cluster_label, nodes_subset in by_cluster.items():
-        osmids = [row["osmid"] for row in nodes_subset]
-        if len(osmids) == 1:
-            Gc.add_node(cluster_label, osmid_original=osmids[0], **G.nodes[osmids[0]])
-        else:
-            xy = (nodes_subset[0]["x"], nodes_subset[0]["y"])
-            attrs = _aggregate_cluster_attrs(osmids, G, xy, node_attr_aggs)
-            Gc.add_node(cluster_label, **attrs)
+    # Single-node clusters: just inherit the original node's attrs.
+    if single_set:
+        single_df = cluster_df.filter(pl.col("cluster").is_in(list(single_set)))
+        for osmid, cid in zip(
+            single_df.get_column("osmid").to_list(),
+            single_df.get_column("cluster").to_list(),
+            strict=True,
+        ):
+            Gc.add_node(int(cid), osmid_original=int(osmid), **G.nodes[int(osmid)])
+
+    # Multi-node clusters: aggregate in one pass.
+    multi_df = cluster_df.filter(~pl.col("cluster").is_in(list(single_set)))
+    if multi_df.height == 0:
+        return
+    aggregated = _aggregate_all_cluster_attrs(multi_df, G, node_attr_aggs)
+    for cid, attrs in aggregated.items():
+        Gc.add_node(cid, **attrs)
 
 
 def _reconnect_edges_to_clusters(

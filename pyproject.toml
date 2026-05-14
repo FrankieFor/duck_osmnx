@@ -56,6 +56,7 @@ docs = ["mkdocs-material>=9", "mkdocstrings[python]>=0.28"]
 examples = ["folium>=0.12", "jupyterlab>=3.0", "mapclassify>=2.5", "igraph>=0.9"]
 lint = ["pip>=25", "pre-commit>=4", "twine>=6", "validate-pyproject[all]>=0.24"]
 test = [
+    "hypothesis>=6",
     "lxml>=5.1",
     "matplotlib>=3.8",
     "pyogrio>=0.7",
