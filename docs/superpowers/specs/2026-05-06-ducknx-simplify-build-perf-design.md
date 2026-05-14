@@ -136,18 +136,19 @@ rust/ducknx-core/
 └── tests/                  # Rust-side unit tests on small fixtures
 ```
 
-**PyO3 surface:**
+**PyO3 surface (narrow by design — endpoint detection stays in Python):**
 
 ```rust
 #[pyfunction]
 fn simplify_topology(
     succ_indptr: PyReadonlyArray1<i64>,
     succ_indices: PyReadonlyArray1<i64>,
-    pred_indptr: PyReadonlyArray1<i64>,
-    pred_indices: PyReadonlyArray1<i64>,
-    forced_endpoints: PyReadonlyArray1<u8>,  // bitmask: rule 4/5 hits from Python
-) -> PyResult<(PyArray1<i64>, PyArray1<i64>, PyArray1<i64>)>
-// returns (paths_offsets, paths_nodes_flat, endpoints)
+    is_endpoint: PyReadonlyArray1<u8>,   // bool mask, Python computes it
+) -> PyResult<(PyArray1<i64>, PyArray1<i64>)>
+// returns (paths_offsets, paths_nodes_flat)
+//
+// Releases the GIL via py.allow_threads during the DFS so other Python
+// threads can make progress on long-running calls.
 
 #[pyfunction]
 fn cluster_assign(
@@ -155,7 +156,14 @@ fn cluster_assign(
     node_ys: PyReadonlyArray1<f64>,
     cluster_polygons_wkb: Vec<&[u8]>,
 ) -> PyResult<PyArray1<i64>>
+// Caller is responsible for passing planar (projected) coordinates;
+// the kernel treats them as such and does not validate CRS.
 ```
+
+Predecessor adjacency stays Python-only (used solely for rule 2/3 endpoint
+detection, which is fast once vectorized). The Rust kernel only needs the
+successor CSR. This keeps the FFI surface minimal and the Rust crate
+focused on the actual hot loop (path tracing).
 
 **Python integration:**
 
@@ -239,19 +247,31 @@ contract — the optimized path must pass it unchanged.
 
 ## Acceptance Gates
 
-**Phase A merge gate:**
-- graph_simplify ≤ 18s on large bbox (≈ half current cost — intermediate target)
+Memory measurements throughout are `tracemalloc.get_traced_memory()` peak per
+stage — same methodology as the existing `benchmarks/bench_pipeline.py`.
+
+**Phase A merge gate (intermediate — controls whether Phase B is required):**
+- graph_simplify ≤ 18s on large bbox (≈ half current cost)
 - graph_build ≤ 8s on large bbox
 - All equivalence and existing tests green
-- No regression > 10% in CI benchmark suite
+- No CI benchmark stage regresses by more than 10%
 
-**Phase B merge gate:**
-- graph_simplify ≤ 10s on large bbox (the pragmatic target)
+**Phase B trigger condition (deterministic, from JSON):**
+- After Phase A merges, the latest run's `benchmarks/results/<sha>.json` is
+  compared against `benchmarks/results/baseline.json` programmatically. Phase B
+  proceeds if and only if `large.graph_simplify.time_s > 10.0` OR
+  `large.graph_build.time_s > 6.0`. No human judgment in the loop.
+
+**Phase B merge gate (pragmatic — workflow goal):**
+- graph_simplify ≤ 10s on large bbox
 - graph_build ≤ 6s on large bbox
-- ≈ 50% peak memory reduction across simplify + build
-- All equivalence tests green with and without Rust extension installed
+- ≥ 50% tracemalloc peak reduction across simplify + build vs. the original
+  baseline (sum of `large.graph_simplify.peak_mb + large.graph_build.peak_mb`)
+- All equivalence tests green with AND without Rust extension installed
 - Wheels build successfully for all five target platforms
-- `pip install ducknx` (no extra) still works on a system without a Rust toolchain
+- `pip install ducknx` (no extra) still works on a system without Rust
+- Cross-version safety: Python wrapper verifies `ducknx_core.__version__`
+  matches a pinned compatible range at import time
 
 ## Risks & Mitigations
 
@@ -267,6 +287,10 @@ contract — the optimized path must pass it unchanged.
 
 Phase A (single PR):
 
+0. **Profile first.** Capture cProfile + tracemalloc breakdown of the current
+   simplify and build stages on Berlin large. Commit the profile artifacts so
+   later phases can verify the bottlenecks actually moved. This guards
+   against optimizing the wrong subroutine.
 1. Add `AdjacencyView` and `_build_adjacency` in `simplification.py`
 2. Replace `_identify_endpoints` and `_get_paths_to_simplify` with
    vectorized + CSR versions
@@ -277,6 +301,9 @@ Phase A (single PR):
 6. Refactor `_split_disconnected_clusters` and `_aggregate_cluster_attrs`
 7. Add equivalence tests + property tests
 8. Run benchmark, attach numbers to the PR
+9. After merge, follow-up commit removes `_simplify_graph_legacy` (it exists
+   only as a reference oracle for equivalence tests during Phase A and
+   becomes dead code once the new implementation is in main)
 
 Phase B (separate PR, only if Phase A misses the pragmatic target):
 

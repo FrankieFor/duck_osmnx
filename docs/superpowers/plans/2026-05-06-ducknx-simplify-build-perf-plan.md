@@ -57,6 +57,72 @@
 - Create: `benchmarks/results/baseline.json`
 - Create: `changelog/2026-05-06_simplify-build-perf-phaseA.md`
 
+### Step 1.0: Profile the current bottlenecks
+
+Before any optimization, capture a profile so we know which Python frames
+actually dominate. This guards against optimizing the wrong subroutine.
+
+- [ ] **Step 1.0a: Create `benchmarks/profile_simplify_build.py`**
+
+```python
+"""Profile simplify+build on Berlin large bbox; commit results as artifact."""
+from __future__ import annotations
+import cProfile
+import io
+import pstats
+import tracemalloc
+from pathlib import Path
+
+import ducknx as dx
+from ducknx import _pbf_reader, graph, settings, simplification, utils_geo
+
+PBF = Path("berlin-latest.osm.pbf")
+BBOX = (13.1, 52.3, 13.8, 52.7)
+
+def main() -> None:
+    settings.pbf_file_path = str(PBF)
+    settings.log_console = False
+    polygon = utils_geo.bbox_to_poly(BBOX)
+    nodes_df, ways_df = _pbf_reader._read_pbf_network_duckdb(polygon, "drive", None, PBF)
+
+    tracemalloc.start()
+    pr = cProfile.Profile()
+    pr.enable()
+    G = graph._create_graph_from_dfs(nodes_df, ways_df, False)
+    Gs = simplification.simplify_graph(G)
+    pr.disable()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    buf = io.StringIO()
+    pstats.Stats(pr, stream=buf).strip_dirs().sort_stats("cumulative").print_stats(40)
+    out = Path("benchmarks/profiles/phaseA-baseline.txt")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(f"tracemalloc peak: {peak / 1024 / 1024:.1f} MB\n\n" + buf.getvalue())
+    print(f"Wrote {out}")
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 1.0b: Run it (or skip with a stub if PBF unavailable)**
+
+```bash
+python benchmarks/profile_simplify_build.py
+```
+
+If `berlin-latest.osm.pbf` is missing, create
+`benchmarks/profiles/phaseA-baseline.txt` containing the line
+`SKIPPED: berlin-latest.osm.pbf not available in this environment` and
+proceed. The profile is a forensic artifact, not a blocker.
+
+- [ ] **Step 1.0c: Commit**
+
+```bash
+git add benchmarks/profile_simplify_build.py benchmarks/profiles/phaseA-baseline.txt
+git commit -m "bench: profile baseline simplify+build cost"
+```
+
 ### Step 1.1: Snapshot the legacy implementation as `_simplify_graph_legacy`
 
 Before touching `simplify_graph`, copy its current body verbatim into a private function `_simplify_graph_legacy` in the same module. The equivalence tests will compare against this. This is a pure save-as-rename, no behavior change.
@@ -229,8 +295,9 @@ def _build_adjacency(G: nx.MultiDiGraph) -> AdjacencyView:
     pred_counts = np.zeros(n, dtype=np.int64)
 
     # First pass: counts (account for parallel edges via len(edge_dict))
-    adj = G._adj
-    pred = G._pred
+    # Use public NetworkX adjacency views — _adj/_pred are private API.
+    adj = G.adj
+    pred = G.pred
     for u, succs in adj.items():
         ui = osmid_to_idx[u]
         for v, ekeys in succs.items():
@@ -378,27 +445,36 @@ def _identify_endpoints_vectorized(
     n = adj.node_ids.size
     is_endpoint = np.zeros(n, dtype=bool)
 
-    # Rule 1: self-loop (idx i has itself in its successor list)
-    for i in range(n):
-        s, e = adj.succ_indptr[i], adj.succ_indptr[i + 1]
-        if i in adj.succ_indices[s:e]:
-            is_endpoint[i] = True
+    # Build per-edge owner arrays once (each succ-entry's source node).
+    # This lets us compute self-loops and unique-neighbor counts with
+    # numpy ops over the flat CSR arrays — no Python per-node loops.
+    src_succ = np.repeat(np.arange(n, dtype=np.int64), np.diff(adj.succ_indptr))
+    src_pred = np.repeat(np.arange(n, dtype=np.int64), np.diff(adj.pred_indptr))
+
+    # Rule 1: self-loop — any (src, dst) pair where src == dst
+    self_loop_srcs = src_succ[src_succ == adj.succ_indices]
+    is_endpoint[self_loop_srcs] = True
 
     # Rule 2: in_degree == 0 or out_degree == 0
     is_endpoint |= (adj.in_degree == 0) | (adj.out_degree == 0)
 
-    # Rule 3: not (neighbors == 2 AND degree in {2, 4})
-    #   neighbors = unique union of succ + pred
-    #   degree = in_degree + out_degree
+    # Rule 3: vectorized unique-neighbor count.
+    # Concatenate (src, neighbor) pairs from both succ and pred CSRs, then
+    # collapse duplicates per source via sort + diff.
+    all_src = np.concatenate([src_succ, src_pred])
+    all_nbr = np.concatenate([adj.succ_indices, adj.pred_indices])
+    # Sort by (src, nbr) so duplicates land adjacent
+    order = np.lexsort((all_nbr, all_src))
+    s_sorted = all_src[order]
+    n_sorted = all_nbr[order]
+    # Identify first occurrence of each (src, nbr) pair
+    first = np.empty(s_sorted.size, dtype=bool)
+    first[0] = True
+    first[1:] = (s_sorted[1:] != s_sorted[:-1]) | (n_sorted[1:] != n_sorted[:-1])
+    # Count uniques per source
+    unique_counts = np.bincount(s_sorted[first], minlength=n).astype(np.int64)
     degree = adj.in_degree + adj.out_degree
-    neighbor_counts = np.empty(n, dtype=np.int64)
-    for i in range(n):
-        s_s, s_e = adj.succ_indptr[i], adj.succ_indptr[i + 1]
-        p_s, p_e = adj.pred_indptr[i], adj.pred_indptr[i + 1]
-        neighbor_counts[i] = np.unique(
-            np.concatenate([adj.succ_indices[s_s:s_e], adj.pred_indices[p_s:p_e]])
-        ).size
-    rule3_pass = (neighbor_counts == 2) & ((degree == 2) | (degree == 4))
+    rule3_pass = (unique_counts == 2) & ((degree == 2) | (degree == 4))
     is_endpoint |= ~rule3_pass
 
     # Rules 4-5: per-node fallback only for survivors
@@ -757,9 +833,12 @@ def test_simplify_graph_matches_legacy_on_realistic() -> None:
     Gnew = simp.simplify_graph(G.copy())
 
     assert set(Glegacy.nodes) == set(Gnew.nodes)
-    assert set(Glegacy.edges()) == set(Gnew.edges())
+    # Multiset comparison: a MultiDiGraph may have parallel edges between the
+    # same (u, v) and set() would silently collapse them.
+    from collections import Counter
+    assert Counter(Glegacy.edges()) == Counter(Gnew.edges())
 
-    for u, v in Glegacy.edges():
+    for u, v in set(Glegacy.edges()):
         legacy_attrs = next(iter(Glegacy[u][v].values()))
         new_attrs = next(iter(Gnew[u][v].values()))
         # geometry equivalence
@@ -777,12 +856,16 @@ def test_simplify_graph_matches_legacy_on_realistic() -> None:
                 assert lv == nv
 ```
 
-- [ ] **Step 1.7b: Run, expect failure**
+- [ ] **Step 1.7b: Run the regression net — must PASS against legacy first**
 
 ```bash
 pytest tests/test_simplification_equivalence.py::test_simplify_graph_matches_legacy_on_realistic -v
 ```
-Expected: PASS at first because `simplify_graph` still has the legacy body — that's fine, this test serves as the regression net for the rewrite.
+
+Expected: PASS. `simplify_graph` still has the legacy body at this point, so
+the test compares legacy-against-legacy. This step exists to prove the test
+itself is correct *before* we rely on it to guard the rewrite in 1.7c. If
+this fails, the test fixture is wrong — fix it before continuing.
 
 - [ ] **Step 1.7c: Replace `simplify_graph` body with the vectorized implementation**
 
@@ -907,9 +990,29 @@ def _aggregate_path_attrs(
         if key in edge_attr_aggs:
             out[key] = edge_attr_aggs[key](values)
         else:
-            uniq = list(dict.fromkeys(values))
+            # Values can be unhashable (e.g. lists from a prior merge), so
+            # dict.fromkeys is unsafe. Use an order-preserving dedup that
+            # falls back to equality comparison.
+            uniq: list[Any] = []
+            for v in values:
+                if v not in uniq:
+                    uniq.append(v)
             out[key] = uniq[0] if len(uniq) == 1 else uniq
     return out, merged
+```
+
+- [ ] **Step 1.7c-bis: Add a fixture covering pre-merged list-valued attrs**
+
+Append to `tests/test_simplification_equivalence.py`:
+
+```python
+def test_simplify_graph_handles_list_valued_attrs() -> None:
+    """Pre-merged list attrs (e.g. osmid=[100,200]) must not crash aggregation."""
+    G = _build_realistic_graph()
+    # Inject a list-valued osmid on one segment to mimic a re-simplification
+    list(G[1][2].values())[0]["osmid"] = [100, 100]
+    Gs = simp.simplify_graph(G.copy())
+    assert Gs.number_of_nodes() > 0
 ```
 
 - [ ] **Step 1.7d: Run equivalence + existing test suite**
@@ -1085,6 +1188,69 @@ git add ducknx/graph.py tests/test_graph_build_dedup.py
 git commit -m "perf(graph): share per-way attr templates, eliminate per-edge dict copy"
 ```
 
+### Step 1.8-bis: Integration test for shared-template mutation hazard
+
+The shared per-way attr templates are safe for `add_edges_from` but become a
+correctness hazard if a downstream stage mutates an edge's dict in place
+(e.g., `distance.add_edge_lengths` writes `length` per edge). Add an
+integration test that runs the full pipeline and asserts each edge's
+`length` is independent.
+
+- [ ] **Step 1.8-bis-a: Add the test**
+
+Append to `tests/test_graph_build_dedup.py`:
+
+```python
+def test_shared_template_does_not_alias_per_edge_length() -> None:
+    """add_edge_lengths writes per-edge length; templates must not alias it."""
+    from ducknx import distance
+
+    nodes, ways = _make_minimal_inputs()
+    # Make the way span 3 nodes so multiple segments share the template
+    ways = pa.table({
+        "osmid": pa.array([10], type=pa.int64()),
+        "refs": pa.array([[1, 2, 3]], type=pa.list_(pa.int64())),
+        "highway": pa.array(["residential"]),
+        "oneway": pa.array([None], type=pa.string()),
+        "name": pa.array(["A"]),
+    })
+    G = g._create_graph_from_dfs(nodes, ways, bidirectional=False)
+    G = distance.add_edge_lengths(G)
+    # Each segment should have its own length value — if templates aliased,
+    # all three segments would share the same dict and the last write wins.
+    e12 = next(iter(G[1][2].values()))
+    e23 = next(iter(G[2][3].values()))
+    assert id(e12) != id(e23), "edge attr dicts must not be aliased"
+```
+
+- [ ] **Step 1.8-bis-b: Run; if it FAILS, the template sharing is unsafe**
+
+```bash
+pytest tests/test_graph_build_dedup.py::test_shared_template_does_not_alias_per_edge_length -v
+```
+
+If it fails, the fix is to make `_build_way_edge_lists` produce a fresh
+`dict(template)` per segment for the segments inserted into NetworkX (the
+NetworkX internals store the dict by reference). The dedup win then comes
+from the `dict(template)` shallow copy being measurably cheaper than the
+full `attrs.copy()` of the legacy code — which it is, because the template
+is built once per way instead of once per edge. Update the helper if
+needed:
+
+```python
+        for j in range(len(nodes) - 1):
+            forward.append((nodes[j], nodes[j + 1], dict(fwd_template)))
+```
+
+Re-run the test until it passes. Commit the fix if any.
+
+- [ ] **Step 1.8-bis-c: Commit**
+
+```bash
+git add tests/test_graph_build_dedup.py ducknx/graph.py
+git commit -m "test(graph): integration test for shared-template alias hazard"
+```
+
 ### Step 1.9: Polars-ify `consolidate_intersections` helpers
 
 - [ ] **Step 1.9a: Add equivalence test**
@@ -1147,19 +1313,18 @@ def _split_disconnected_clusters(
         .rename({"new_cluster": "cluster"})
     )
 
-    # Recompute cluster centroids for any cluster that contains > 1 node
-    sizes = out.group_by("cluster").len().rename({"len": "n"})
-    multi = sizes.filter(pl.col("n") > 1).get_column("cluster").to_list()
-    for cid in multi:
-        members = out.filter(pl.col("cluster") == cid)
-        cx = float(members.get_column("x").mean())
-        cy = float(members.get_column("y").mean())
-        out = out.with_columns(
-            pl.when(pl.col("cluster") == cid)
-              .then(pl.lit(cx)).otherwise(pl.col("x")).alias("x"),
-            pl.when(pl.col("cluster") == cid)
-              .then(pl.lit(cy)).otherwise(pl.col("y")).alias("y"),
-        )
+    # Recompute cluster centroids via a single group_by → join.
+    # The legacy version looped per-cluster and rebuilt the DataFrame each
+    # iteration (O(N·K) where K is the number of multi-node clusters).
+    centroids = (
+        out.group_by("cluster")
+           .agg(pl.col("x").mean().alias("cx"), pl.col("y").mean().alias("cy"))
+    )
+    out = (
+        out.join(centroids, on="cluster", how="left")
+           .with_columns(pl.col("cx").alias("x"), pl.col("cy").alias("y"))
+           .drop("cx", "cy")
+    )
     return out.select(["osmid", "x", "y", "cluster"])
 ```
 
@@ -1343,16 +1508,50 @@ git commit -m "feat(bench): add --track mode and commit Phase A baseline"
 python benchmarks/bench_pipeline.py --track
 ```
 
-- [ ] **Step 1.11b: Compare against baseline**
+- [ ] **Step 1.11b: Compare against baseline (deterministic JSON gate)**
+
+Create `benchmarks/compare.py` so the gate is reusable in CI and in Phase B
+trigger detection:
+
+```python
+"""Compare latest benchmark JSON against baseline; exit non-zero on regression."""
+from __future__ import annotations
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+def latest_sha() -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"]
+    ).decode().strip()
+
+def main() -> None:
+    root = Path(__file__).parent / "results"
+    base = json.loads((root / "baseline.json").read_text())
+    new = json.loads((root / f"{latest_sha()}.json").read_text())
+    s_old = base["large"]["graph_simplify"]["time_s"]
+    s_new = new["large"]["graph_simplify"]["time_s"]
+    b_old = base["large"]["graph_build"]["time_s"]
+    b_new = new["large"]["graph_build"]["time_s"]
+    print(f"simplify large: {s_old:.2f}s -> {s_new:.2f}s")
+    print(f"build    large: {b_old:.2f}s -> {b_new:.2f}s")
+    # Phase A gate
+    if s_new > 18.0 or b_new > 8.0:
+        print("FAIL: Phase A gate (simplify ≤18s, build ≤8s) missed")
+        sys.exit(1)
+    # Phase B trigger
+    if s_new > 10.0 or b_new > 6.0:
+        print("PHASE_B_REQUIRED")
+    else:
+        print("PHASE_B_NOT_REQUIRED")
+
+if __name__ == "__main__":
+    main()
+```
 
 ```bash
-python -c "
-import json, sys
-base = json.load(open('benchmarks/results/baseline.json'))
-new = json.load(open(f'benchmarks/results/' + open('.git/HEAD').read().strip().split()[-1].split('/')[-1] + '.json'))
-print(f'simplify large: {base[\"large\"][\"graph_simplify\"][\"time_s\"]:.2f}s -> {new[\"large\"][\"graph_simplify\"][\"time_s\"]:.2f}s')
-print(f'build    large: {base[\"large\"][\"graph_build\"][\"time_s\"]:.2f}s -> {new[\"large\"][\"graph_build\"][\"time_s\"]:.2f}s')
-"
+python benchmarks/compare.py
 ```
 
 Acceptance: `simplify large ≤ 18s` AND `build large ≤ 8s`.
@@ -1414,6 +1613,32 @@ Expected: all green.
 git push -u origin "$(git branch --show-current)"
 ```
 
+### Step 1.13: Remove `_simplify_graph_legacy` after Phase A merges
+
+`_simplify_graph_legacy` exists only as a reference oracle for the
+equivalence tests during Phase A development. Once the new
+`simplify_graph` is in main and proven correct, the legacy snapshot
+becomes dead code. Future maintainers should not have to guess whether
+it is safe to delete.
+
+- [ ] **Step 1.13a: After Phase A PR merges to main, open a follow-up PR**
+
+```bash
+git checkout main && git pull
+git checkout -b cleanup/remove-simplify-graph-legacy
+```
+
+Delete `_simplify_graph_legacy` from `ducknx/simplification.py`. Update
+`tests/test_simplification_equivalence.py` to remove the legacy-comparison
+tests (the property tests and Rust-vs-Python tests remain as the
+correctness gate going forward).
+
+```bash
+pytest tests/ -x -q  # must stay green
+git commit -am "chore(simplify): remove _simplify_graph_legacy reference snapshot"
+git push -u origin cleanup/remove-simplify-graph-legacy
+```
+
 ---
 
 ## Task 2: Phase B — Rust extension (separate beads task / separate PR)
@@ -1446,15 +1671,20 @@ git push -u origin "$(git branch --show-current)"
 
 ### Step 2.1: Decide if Phase B is needed
 
-- [ ] **Step 2.1a: Read Phase A changelog**
-
-Open `changelog/2026-05-06_simplify-build-perf-phaseA.md`. If both `simplify ≤ 10s` AND `build ≤ 6s`, close this task without implementation:
+- [ ] **Step 2.1a: Run the deterministic Phase B trigger check**
 
 ```bash
-bd close <THIS_TASK_ID> --reason="Phase A met pragmatic targets; no Rust port needed"
+python benchmarks/compare.py
 ```
 
-Otherwise continue.
+If the output contains `PHASE_B_NOT_REQUIRED`, close this task without
+implementation:
+
+```bash
+bd close <THIS_TASK_ID> --reason="Phase A met pragmatic targets; Rust port not needed"
+```
+
+Only continue if the output contains `PHASE_B_REQUIRED`.
 
 ### Step 2.2: Scaffold the Rust crate
 
@@ -1657,11 +1887,11 @@ pub fn simplify_topology<'py>(
     let succ_indices_slice = succ_indices.as_slice()?;
     let endpoint_bools: Vec<bool> = is_endpoint.as_slice()?.iter().map(|b| *b != 0).collect();
 
-    let (offsets, nodes_flat) = trace_paths_native(
-        succ_indptr_slice,
-        succ_indices_slice,
-        &endpoint_bools,
-    );
+    // Release the GIL during the DFS — for ~1M-node graphs this can run
+    // for seconds and we shouldn't block other Python threads.
+    let (offsets, nodes_flat) = py.allow_threads(|| {
+        trace_paths_native(succ_indptr_slice, succ_indices_slice, &endpoint_bools)
+    });
     Ok((offsets.to_pyarray_bound(py), nodes_flat.to_pyarray_bound(py)))
 }
 ```
@@ -1774,18 +2004,82 @@ pub fn cluster_assign<'py>(
 }
 ```
 
-- [ ] **Step 2.4b: Rebuild and smoke-test**
+- [ ] **Step 2.4b: Rebuild**
 
 ```bash
 cd rust/ducknx-core
 maturin develop
 ```
 
-- [ ] **Step 2.4c: Commit**
+- [ ] **Step 2.4c: WKB round-trip compatibility test**
+
+Shapely emits ISO WKB; the `wkb` crate's behavior with multipolygons-with-
+holes and big-endian byte order is a known footgun. Verify with a real
+shapely-generated payload before committing the dependency.
+
+Create `tests/test_rust_cluster_wkb.py`:
+
+```python
+"""Round-trip shapely → Rust cluster_assign on tricky polygon shapes."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import shapely
+
+pytest.importorskip("ducknx_core")
+from ducknx_core import cluster_assign
+
+
+def test_simple_square() -> None:
+    sq = shapely.box(0, 0, 1, 1)
+    wkb = shapely.to_wkb(sq)
+    xs = np.array([0.5, 2.0], dtype=np.float64)
+    ys = np.array([0.5, 2.0], dtype=np.float64)
+    out = cluster_assign(xs, ys, [wkb])
+    assert out[0] == 0
+    assert out[1] == -1
+
+
+def test_polygon_with_hole() -> None:
+    outer = shapely.box(0, 0, 10, 10)
+    inner = shapely.box(4, 4, 6, 6)
+    donut = outer.difference(inner)
+    wkb = shapely.to_wkb(donut)
+    xs = np.array([1.0, 5.0], dtype=np.float64)
+    ys = np.array([1.0, 5.0], dtype=np.float64)
+    out = cluster_assign(xs, ys, [wkb])
+    assert out[0] == 0    # inside ring
+    assert out[1] == -1   # inside the hole
+
+
+def test_multipolygon() -> None:
+    a = shapely.box(0, 0, 1, 1)
+    b = shapely.box(10, 10, 11, 11)
+    mp = shapely.MultiPolygon([a, b])
+    wkb = shapely.to_wkb(mp)
+    xs = np.array([0.5, 10.5, 5.0], dtype=np.float64)
+    ys = np.array([0.5, 10.5, 5.0], dtype=np.float64)
+    out = cluster_assign(xs, ys, [wkb])
+    assert out[0] == 0
+    assert out[1] == 0
+    assert out[2] == -1
+```
 
 ```bash
-git add rust/ducknx-core/src/cluster.rs
-git commit -m "feat(rust): implement cluster_assign with rstar PIP batch"
+pytest tests/test_rust_cluster_wkb.py -v
+```
+
+Expected: all three PASS. If `test_polygon_with_hole` or `test_multipolygon`
+fails, the `wkb` crate is not handling shapely's output correctly — switch
+to the `wkt` crate or write a thin parser in `cluster.rs` before committing.
+
+- [ ] **Step 2.4d: Commit**
+
+```bash
+git add rust/ducknx-core/src/cluster.rs tests/test_rust_cluster_wkb.py
+git commit -m "feat(rust): cluster_assign with rstar PIP + WKB round-trip tests"
 ```
 
 ### Step 2.5: Wire the Rust extension into ducknx via `HAVE_RUST`
@@ -1802,17 +2096,43 @@ pure-Python implementations remain in use unchanged.
 
 from __future__ import annotations
 
-try:
-    from ducknx_core import cluster_assign as _cluster_assign  # type: ignore[import-not-found]
-    from ducknx_core import simplify_topology as _simplify_topology  # type: ignore[import-not-found]
-    HAVE_RUST = True
-except ImportError:  # pragma: no cover
-    HAVE_RUST = False
-    _simplify_topology = None
-    _cluster_assign = None
+import os
+import warnings
+
+# Compatible ducknx_core version range. Bump this whenever the FFI signature
+# changes; the wrapper refuses to use a mismatched extension rather than
+# crash mysteriously at call time.
+_COMPATIBLE = ">=0.1.0,<0.2.0"
+
+HAVE_RUST = False
+_simplify_topology = None
+_cluster_assign = None
+
+if not os.environ.get("DUCKNX_DEBUG_NO_RUST"):
+    try:
+        import ducknx_core  # type: ignore[import-not-found]
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        if Version(ducknx_core.__version__) in SpecifierSet(_COMPATIBLE):
+            _simplify_topology = ducknx_core.simplify_topology
+            _cluster_assign = ducknx_core.cluster_assign
+            HAVE_RUST = True
+        else:
+            warnings.warn(
+                f"ducknx_core {ducknx_core.__version__} is outside compatible "
+                f"range {_COMPATIBLE}; falling back to Python implementation.",
+                stacklevel=2,
+            )
+    except ImportError:  # pragma: no cover
+        pass
 
 __all__ = ["HAVE_RUST", "_cluster_assign", "_simplify_topology"]
 ```
+
+Note: this requires `packaging` to be importable. It's a transitive dep of
+pip/setuptools so almost always available, but if a test environment fails
+to find it, add `packaging` to the runtime dependencies in `pyproject.toml`.
 
 - [ ] **Step 2.5b: Route `_trace_paths` through Rust when available**
 
@@ -1909,8 +2229,21 @@ jobs:
           CIBW_BUILD: "cp312-* cp313-*"
           CIBW_BEFORE_BUILD: "pip install maturin"
           CIBW_PROJECT_REQUIRES_PYTHON: ">=3.12"
+          # Verify the wheel imports and the FFI functions exist on every platform
+          CIBW_TEST_COMMAND: >-
+            python -c "import ducknx_core, numpy as np;
+            o, n = ducknx_core.simplify_topology(
+            np.array([0,1,2,3,3], dtype=np.int64),
+            np.array([1,2,3], dtype=np.int64),
+            np.array([1,0,0,1], dtype=np.uint8));
+            assert list(o) == [0, 4] and list(n) == [0, 1, 2, 3]"
         with:
           package-dir: rust/ducknx-core
+      - name: Run Rust unit tests on this host (Windows MSVC sanity)
+        if: runner.os == 'Windows'
+        run: |
+          cd rust/ducknx-core
+          cargo test --release
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.arch }}
