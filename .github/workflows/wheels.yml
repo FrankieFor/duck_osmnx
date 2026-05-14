@@ -1,0 +1,52 @@
+name: Build wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, arch: arm64 }
+          - { os: macos-13, arch: x86_64 }
+          - { os: ubuntu-latest, arch: x86_64 }
+          - { os: ubuntu-24.04-arm, arch: aarch64 }
+          - { os: windows-latest, arch: AMD64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_ARCHS: ${{ matrix.arch }}
+          CIBW_BUILD: "cp312-* cp313-*"
+          CIBW_BEFORE_BUILD: "pip install maturin"
+          CIBW_PROJECT_REQUIRES_PYTHON: ">=3.12"
+          # Verify the wheel imports and the FFI functions exist on every platform.
+          CIBW_TEST_COMMAND: >-
+            python -c "import ducknx_core, numpy as np;
+            o, n = ducknx_core.simplify_topology(
+            np.array([0,1,2,3,3], dtype=np.int64),
+            np.array([1,2,3], dtype=np.int64),
+            np.array([1,0,0,1], dtype=np.uint8));
+            assert list(o) == [0, 4] and list(n) == [0, 1, 2, 3]"
+        with:
+          package-dir: rust/ducknx-core
+      - name: Run Rust unit tests on this host (Windows MSVC sanity)
+        if: runner.os == 'Windows'
+        run: |
+          cd rust/ducknx-core
+          cargo test --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.arch }}
+          path: ./wheelhouse/*.whl

@@ -32,6 +32,7 @@ dependencies = [
   "polars>=1.40.1",
   "pyarrow>=23.0.0",
   "pyogrio>=0.7",
+  "packaging>=23",
   "pyproj>=3.6",
   "shapely>=2.0",
 ]
@@ -43,7 +44,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 version = "3.0.0"
 [project.optional-dependencies]
-fast = ["rustworkx>=0.15"]
+fast = ["rustworkx>=0.15", "ducknx-core>=0.1.0,<0.2.0"]
 plot = ["matplotlib>=3.8"]
 
 [dependency-groups]
