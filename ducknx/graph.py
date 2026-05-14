@@ -543,72 +543,83 @@ def graph_from_polygon(
     return G
 
 
-def _build_way_edges(
-    i: int,
-    osmid_arr: np.ndarray,  # type: ignore[type-arg]
-    refs_arr: np.ndarray,  # type: ignore[type-arg]
-    tag_arrays: dict[str, np.ndarray],  # type: ignore[type-arg]
-    tag_cols: list[str],
+def _build_way_edge_lists(
+    ways_pl: pl.DataFrame,
     bidirectional: bool,  # noqa: FBT001
-    oneway_values: set[str],
-    reversed_values: set[str],
-) -> tuple[list[tuple[int, int, dict[str, Any]]], list[tuple[int, int, dict[str, Any]]]]:
+) -> tuple[
+    list[tuple[int, int, dict[str, Any]]],
+    list[tuple[int, int, dict[str, Any]]],
+]:
     """
-    Build forward and reverse edge tuples for a single way.
+    Build forward and reverse edge tuple lists with shared per-way attr templates.
+
+    For each way, every edge segment between consecutive nodes shares the
+    same tag values; only ``reversed`` differs between forward and reverse.
+    We therefore materialize at most two attribute templates per way (a
+    forward template and a reverse template) and shallow-copy them per
+    segment. The cost of one ``dict(template)`` per segment is much lower
+    than the legacy code's per-edge ``attrs.copy()`` (which also re-built
+    the tag dict from scratch each time inside the per-way function).
+    Shallow-copying per segment is required because downstream stages
+    (e.g. ``distance.add_edge_lengths``) write per-edge attributes into
+    these dicts.
 
     Parameters
     ----------
-    i
-        Row index in the way arrays.
-    osmid_arr
-        Array of OSM way IDs.
-    refs_arr
-        Array of node reference lists.
-    tag_arrays
-        Dict mapping tag column names to arrays of values.
-    tag_cols
-        List of tag column names.
+    ways_pl
+        Polars DataFrame of ways with columns: ``osmid``, ``refs``, plus
+        useful tag columns.
     bidirectional
-        If True, create bidirectional edges for one-way streets.
-    oneway_values
-        Set of values OSM uses for "oneway" tag.
-    reversed_values
-        Set of values OSM uses for reversed direction.
+        Whether the network type is bidirectional.
 
     Returns
     -------
-    forward_edges, reverse_edges
-        Lists of (u, v, attrs) tuples for forward and reverse directions.
+    forward_edges
+        List of ``(u, v, attrs)`` tuples for the forward direction.
+    reverse_edges
+        List of ``(v, u, attrs)`` tuples for the reverse direction (empty
+        for one-way edges).
     """
-    # build attribute dict from non-null tag values
-    attrs: dict[str, Any] = {"osmid": osmid_arr[i]}
-    for col in tag_cols:
-        val = tag_arrays[col][i]
-        if val is not None and not (isinstance(val, float) and math.isnan(val)):
-            attrs[col] = val
+    oneway_values = {"yes", "true", "1", "-1", "reverse", "T", "F"}
+    reversed_values = {"-1", "reverse", "T"}
+    tag_cols = [c for c in ways_pl.columns if c not in ("osmid", "refs")]
 
-    # deduplicate consecutive nodes
-    raw_refs = refs_arr[i]
-    nodes = [raw_refs[0]]
-    nodes.extend(raw_refs[j] for j in range(1, len(raw_refs)) if raw_refs[j] != raw_refs[j - 1])
+    osmid_arr = ways_pl.get_column("osmid").to_numpy()
+    refs_arr = ways_pl.get_column("refs").to_list()
+    tag_arrays = {col: ways_pl.get_column(col).to_list() for col in tag_cols}
 
-    # determine one-way and reversed status
-    is_one_way = _is_path_one_way(attrs, bidirectional, oneway_values)
-    if is_one_way and _is_path_reversed(attrs, reversed_values):
-        nodes.reverse()
-
-    if not settings.all_oneway:
-        attrs["oneway"] = is_one_way
-
-    # build forward edge pairs
-    attrs["reversed"] = False
-    forward = [(nodes[j], nodes[j + 1], attrs.copy()) for j in range(len(nodes) - 1)]
-
-    # build reverse edges for non-one-way paths
+    forward: list[tuple[int, int, dict[str, Any]]] = []
     reverse: list[tuple[int, int, dict[str, Any]]] = []
-    if not is_one_way:
-        attrs_rev = {**attrs, "reversed": True}
-        reverse = [(nodes[j + 1], nodes[j], attrs_rev.copy()) for j in range(len(nodes) - 1)]
+
+    for i in range(ways_pl.height):
+        attrs: dict[str, Any] = {"osmid": osmid_arr[i]}
+        for col in tag_cols:
+            val = tag_arrays[col][i]
+            if val is not None and not (isinstance(val, float) and math.isnan(val)):
+                attrs[col] = val
+
+        raw_refs = refs_arr[i]
+        nodes = [raw_refs[0]]
+        nodes.extend(
+            raw_refs[j] for j in range(1, len(raw_refs)) if raw_refs[j] != raw_refs[j - 1]
+        )
+
+        is_one_way = _is_path_one_way(attrs, bidirectional, oneway_values)
+        if is_one_way and _is_path_reversed(attrs, reversed_values):
+            nodes.reverse()
+
+        if not settings.all_oneway:
+            attrs["oneway"] = is_one_way
+
+        # Shared forward template built once per way; shallow-copy per segment.
+        fwd_template = {**attrs, "reversed": False}
+        for j in range(len(nodes) - 1):
+            forward.append((nodes[j], nodes[j + 1], dict(fwd_template)))
+
+        if not is_one_way:
+            rev_template = {**attrs, "reversed": True}
+            for j in range(len(nodes) - 1):
+                reverse.append((nodes[j + 1], nodes[j], dict(rev_template)))
 
     return forward, reverse
 
@@ -679,29 +690,13 @@ def _create_graph_from_dfs(
     ways_pl = pl.from_arrow(ways_df)
     if not isinstance(ways_pl, pl.DataFrame):
         ways_pl = pl.DataFrame(ways_pl)
-    tag_cols = [c for c in ways_pl.columns if c not in ("osmid", "refs")]
-    oneway_values = {"yes", "true", "1", "-1", "reverse", "T", "F"}
-    reversed_values = {"-1", "reverse", "T"}
-
-    all_edges_forward: list[tuple[int, int, dict[str, Any]]] = []
-    all_edges_reverse: list[tuple[int, int, dict[str, Any]]] = []
-
-    osmid_arr = ways_pl.get_column("osmid").to_numpy()
-    refs_arr = ways_pl.get_column("refs").to_list()
-    tag_arrays = {col: ways_pl.get_column(col).to_list() for col in tag_cols}
 
     msg = (
         f"Creating graph from {nodes_pl.height:,} OSM nodes and {ways_pl.height:,} OSM ways..."
     )
     utils.log(msg, level=lg.INFO)
 
-    for i in range(ways_pl.height):
-        fwd, rev = _build_way_edges(
-            i, osmid_arr, refs_arr, tag_arrays, tag_cols,
-            bidirectional, oneway_values, reversed_values,
-        )
-        all_edges_forward.extend(fwd)
-        all_edges_reverse.extend(rev)
+    all_edges_forward, all_edges_reverse = _build_way_edge_lists(ways_pl, bidirectional)
 
     # single bulk insert for all edges
     G.add_edges_from(all_edges_forward)
@@ -766,21 +761,21 @@ def _build_rx_edges(
         if not settings.all_oneway:
             attrs["oneway"] = is_one_way
 
-        # Forward edges
-        attrs["reversed"] = False
+        # Forward edges (template built once per way, shallow-copied per segment)
+        fwd_template = {**attrs, "reversed": False}
         for j in range(len(nodes) - 1):
             u_osm, v_osm = nodes[j], nodes[j + 1]
             if u_osm in osm_to_rx and v_osm in osm_to_rx:
-                edge_list.append((osm_to_rx[u_osm], osm_to_rx[v_osm], attrs.copy()))
+                edge_list.append((osm_to_rx[u_osm], osm_to_rx[v_osm], dict(fwd_template)))
 
         # Reverse edges for bidirectional
         if not is_one_way:
-            attrs_rev = {**attrs, "reversed": True}
+            rev_template = {**attrs, "reversed": True}
             for j in range(len(nodes) - 1):
                 u_osm, v_osm = nodes[j], nodes[j + 1]
                 if u_osm in osm_to_rx and v_osm in osm_to_rx:
                     edge_list.append(
-                        (osm_to_rx[v_osm], osm_to_rx[u_osm], attrs_rev.copy()),
+                        (osm_to_rx[v_osm], osm_to_rx[u_osm], dict(rev_template)),
                     )
 
     return edge_list

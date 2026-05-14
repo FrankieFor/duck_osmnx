@@ -1189,64 +1189,74 @@ def _split_disconnected_clusters(
     G: nx.MultiDiGraph,
 ) -> pl.DataFrame:
     """
-    Split disconnected clusters into connected subclusters.
+    Split disconnected clusters into connected subclusters (polars-native).
 
     If a cluster contains multiple weakly connected components, move each
-    component to its own subcluster to avoid connecting nodes that are not
-    truly connected (e.g., nearby dead-ends or surface streets with bridge).
+    component to its own subcluster so we don't fuse topologically
+    disconnected nodes (e.g. surface streets that visually overlap a bridge).
 
     Parameters
     ----------
-    gdf
-        Node-to-cluster mapping GeoDataFrame.
-    node_points
-        Original graph's node points GeoDataFrame.
+    cluster_df
+        Polars DataFrame with columns ``osmid``, ``x``, ``y``, ``cluster``.
     G
         The original projected graph.
 
     Returns
     -------
-    cluster_df
-        Polars DataFrame (`osmid`, `x`, `y`, `cluster`) with disconnected
-        clusters split into subclusters and unique integer cluster IDs.
+    out
+        Polars DataFrame with the same columns; ``cluster`` reassigned to
+        sequential integer IDs of WCC-split clusters, and ``x``/``y`` set to
+        the centroid of each connected subcluster.
     """
-    rows = cluster_df.to_dicts()
-    by_cluster: dict[Any, list[dict[str, Any]]] = {}
-    for row in rows:
-        by_cluster.setdefault(row["cluster"], []).append(row)
+    grouped = (
+        cluster_df.group_by("cluster", maintain_order=True)
+        .agg(pl.col("osmid"))
+    )
 
-    new_label_seq = 0
-    relabeled: list[dict[str, Any]] = []
-    for nodes_subset in by_cluster.values():
-        osmids = [row["osmid"] for row in nodes_subset]
-        if len(osmids) > 1:
-            wccs = list(nx.weakly_connected_components(G.subgraph(osmids)))
-            if len(wccs) > 1:
-                # multiple weakly-connected components in one cluster: split
-                node_to_wcc = {n: idx for idx, wcc in enumerate(wccs) for n in wcc}
-                # group rows by wcc, assign each its own new label + centroid
-                wcc_groups: dict[int, list[dict[str, Any]]] = {}
-                for row in nodes_subset:
-                    wcc_groups.setdefault(node_to_wcc[row["osmid"]], []).append(row)
-                for group in wcc_groups.values():
-                    pts = shapely.points(
-                        np.array([r["x"] for r in group], dtype=np.float64),
-                        np.array([r["y"] for r in group], dtype=np.float64),
-                    )
-                    centroid = shapely.union_all(pts).centroid
-                    for r in group:
-                        r["x"] = float(centroid.x)
-                        r["y"] = float(centroid.y)
-                        r["cluster"] = new_label_seq
-                    new_label_seq += 1
-                    relabeled.extend(group)
-                continue
-        for row in nodes_subset:
-            row["cluster"] = new_label_seq
-        new_label_seq += 1
-        relabeled.extend(nodes_subset)
+    # Walk per cluster (small list) computing WCC splits.
+    new_label = 0
+    osmid_to_new: dict[int, int] = {}
+    for osmids in grouped.get_column("osmid").to_list():
+        if len(osmids) == 1:
+            osmid_to_new[int(osmids[0])] = new_label
+            new_label += 1
+            continue
+        wccs = list(nx.weakly_connected_components(G.subgraph(osmids)))
+        if len(wccs) == 1:
+            for o in osmids:
+                osmid_to_new[int(o)] = new_label
+            new_label += 1
+        else:
+            for wcc in wccs:
+                for o in wcc:
+                    osmid_to_new[int(o)] = new_label
+                new_label += 1
 
-    return pl.DataFrame(relabeled, schema=cluster_df.schema)
+    relabel = pl.DataFrame(
+        {
+            "osmid": list(osmid_to_new.keys()),
+            "new_cluster": list(osmid_to_new.values()),
+        },
+        schema={"osmid": cluster_df.schema["osmid"], "new_cluster": pl.Int64},
+    )
+    out = (
+        cluster_df.join(relabel, on="osmid", how="left")
+        .drop("cluster")
+        .rename({"new_cluster": "cluster"})
+    )
+
+    # Recompute centroids in a single group_by + join (no per-cluster Python loop).
+    centroids = (
+        out.group_by("cluster")
+        .agg(pl.col("x").mean().alias("cx"), pl.col("y").mean().alias("cy"))
+    )
+    out = (
+        out.join(centroids, on="cluster", how="left")
+        .with_columns(pl.col("cx").alias("x"), pl.col("cy").alias("y"))
+        .drop("cx", "cy")
+    )
+    return out.select(["osmid", "x", "y", "cluster"])
 
 
 def _aggregate_cluster_attrs(
@@ -1332,6 +1342,76 @@ def _named_agg(name: str, values: list[Any]) -> Any:  # noqa: ANN401
     return method()
 
 
+def _aggregate_all_cluster_attrs(
+    cluster_df: pl.DataFrame,
+    G: nx.MultiDiGraph,
+    node_attr_aggs: dict[str, Any],
+) -> dict[int, dict[str, Any]]:
+    """
+    Aggregate node attributes for every cluster in a single pass over G.nodes.
+
+    Parameters
+    ----------
+    cluster_df
+        Polars DataFrame with columns ``osmid``, ``x``, ``y``, ``cluster``.
+    G
+        Source graph supplying node attributes.
+    node_attr_aggs
+        Mapping from attribute name to aggregation function (callable) or
+        polars-named aggregation (string).
+
+    Returns
+    -------
+    out
+        Mapping ``cluster_id -> attrs dict``. Each dict carries
+        ``osmid_original``, ``x``, ``y``, and merged tag attributes.
+    """
+    osmid_col = cluster_df.get_column("osmid").to_list()
+    cluster_col = cluster_df.get_column("cluster").to_list()
+    x_col = cluster_df.get_column("x").to_list()
+    y_col = cluster_df.get_column("y").to_list()
+
+    per_cluster: dict[int, dict[str, list[Any]]] = {}
+    cluster_xy: dict[int, tuple[float, float]] = {}
+    for osmid, cid, x, y in zip(osmid_col, cluster_col, x_col, y_col, strict=True):
+        cid_int = int(cid)
+        bucket = per_cluster.setdefault(cid_int, {"osmid_original": []})
+        bucket["osmid_original"].append(int(osmid))
+        cluster_xy.setdefault(cid_int, (float(x), float(y)))
+        for key, val in G.nodes[int(osmid)].items():
+            if val is None:
+                continue
+            bucket.setdefault(key, []).append(val)
+
+    out: dict[int, dict[str, Any]] = {}
+    for cid, attrs in per_cluster.items():
+        x, y = cluster_xy[cid]
+        merged: dict[str, Any] = {
+            "osmid_original": attrs.pop("osmid_original"),
+            "x": x,
+            "y": y,
+        }
+        for key, values in attrs.items():
+            if key in {"x", "y"}:
+                continue
+            if key in node_attr_aggs:
+                agg = node_attr_aggs[key]
+                try:
+                    merged[key] = agg(values) if callable(agg) else _named_agg(agg, values)
+                except (TypeError, ValueError):
+                    merged[key] = values
+                continue
+            if key == "street_count":
+                continue
+            uniq = list(dict.fromkeys(values))
+            if len(uniq) == 1:
+                merged[key] = uniq[0]
+            elif len(uniq) > 1:
+                merged[key] = uniq
+        out[cid] = merged
+    return out
+
+
 def _build_consolidated_nodes(
     Gc: nx.MultiDiGraph,
     cluster_df: pl.DataFrame,
@@ -1340,6 +1420,10 @@ def _build_consolidated_nodes(
 ) -> None:
     """
     Create a new node in ``Gc`` for each cluster in ``cluster_df``.
+
+    Single-pass implementation: walks the cluster table once via
+    ``_aggregate_all_cluster_attrs`` and emits one ``add_node`` call per
+    cluster (instead of looping over per-cluster subsets in Python).
 
     Parameters
     ----------
@@ -1352,19 +1436,28 @@ def _build_consolidated_nodes(
     node_attr_aggs
         Node attribute aggregation functions.
     """
-    rows = cluster_df.to_dicts()
-    by_cluster: dict[int, list[dict[str, Any]]] = {}
-    for row in rows:
-        by_cluster.setdefault(row["cluster"], []).append(row)
+    # Identify single-node clusters so we can copy their attrs verbatim.
+    sizes = cluster_df.group_by("cluster").len().rename({"len": "n"})
+    single = sizes.filter(pl.col("n") == 1).get_column("cluster").to_list()
+    single_set = {int(c) for c in single}
 
-    for cluster_label, nodes_subset in by_cluster.items():
-        osmids = [row["osmid"] for row in nodes_subset]
-        if len(osmids) == 1:
-            Gc.add_node(cluster_label, osmid_original=osmids[0], **G.nodes[osmids[0]])
-        else:
-            xy = (nodes_subset[0]["x"], nodes_subset[0]["y"])
-            attrs = _aggregate_cluster_attrs(osmids, G, xy, node_attr_aggs)
-            Gc.add_node(cluster_label, **attrs)
+    # Single-node clusters: just inherit the original node's attrs.
+    if single_set:
+        single_df = cluster_df.filter(pl.col("cluster").is_in(list(single_set)))
+        for osmid, cid in zip(
+            single_df.get_column("osmid").to_list(),
+            single_df.get_column("cluster").to_list(),
+            strict=True,
+        ):
+            Gc.add_node(int(cid), osmid_original=int(osmid), **G.nodes[int(osmid)])
+
+    # Multi-node clusters: aggregate in one pass.
+    multi_df = cluster_df.filter(~pl.col("cluster").is_in(list(single_set)))
+    if multi_df.height == 0:
+        return
+    aggregated = _aggregate_all_cluster_attrs(multi_df, G, node_attr_aggs)
+    for cid, attrs in aggregated.items():
+        Gc.add_node(cid, **attrs)
 
 
 def _reconnect_edges_to_clusters(

@@ -1,0 +1,21 @@
+{
+  "_meta": {
+    "source": "spec_estimate",
+    "note": "Seeded from docs/superpowers/specs numbers; not measured locally"
+  },
+  "small": {
+    "graph_build": {"time_s": 0.03, "peak_mb": 2.2},
+    "graph_simplify": {"time_s": 0.07, "peak_mb": 1.4},
+    "end_to_end_graph": {"time_s": 2.56, "peak_mb": 12.1}
+  },
+  "medium": {
+    "graph_build": {"time_s": 1.83, "peak_mb": 135.5},
+    "graph_simplify": {"time_s": 4.83, "peak_mb": 84.1},
+    "end_to_end_graph": {"time_s": 13.89, "peak_mb": 234.8}
+  },
+  "large": {
+    "graph_build": {"time_s": 12.72, "peak_mb": 841.9},
+    "graph_simplify": {"time_s": 31.74, "peak_mb": 527.4},
+    "end_to_end_graph": {"time_s": 70.86, "peak_mb": 1122.7}
+  }
+}

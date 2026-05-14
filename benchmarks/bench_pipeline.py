@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
+import json
+import subprocess
 import sys
 import time
 import tracemalloc
 from pathlib import Path
+from typing import Any
+from typing import Callable
 
 import ducknx as dx
 from ducknx import _duckdb
@@ -28,8 +33,14 @@ SCALES = [
 ]
 
 
-def _timed(label: str, func, *args, **kwargs):
-    """Run func, return (result, wall_seconds, peak_mb)."""
+def _timed(
+    label: str,
+    func: Callable[..., Any],
+    *args: Any,
+    timings: dict[str, dict[str, float]] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Run func, return result; optionally record timings."""
     tracemalloc.start()
     t0 = time.perf_counter()
     result = func(*args, **kwargs)
@@ -38,70 +49,88 @@ def _timed(label: str, func, *args, **kwargs):
     tracemalloc.stop()
     peak_mb = peak / 1024 / 1024
     print(f"  {label:25s}  {elapsed:8.2f}s  {peak_mb:8.1f} MB")
+    if timings is not None:
+        timings[label] = {"time_s": float(elapsed), "peak_mb": float(peak_mb)}
     return result
 
 
-def bench_scale(name: str, bbox: tuple[float, float, float, float]) -> None:
-    """Benchmark all stages for one scale tier."""
-    print(f"\n{'='*60}")
+def bench_scale_collect(
+    name: str, bbox: tuple[float, float, float, float],
+) -> dict[str, dict[str, float]]:
+    """Benchmark all stages for one scale tier; return per-stage timings."""
+    print(f"\n{'=' * 60}")
     print(f"Scale: {name}  bbox={bbox}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  {'Stage':25s}  {'Time':>8s}  {'Peak Mem':>8s}")
-    print(f"  {'-'*25}  {'-'*8}  {'-'*8}")
+    print(f"  {'-' * 25}  {'-' * 8}  {'-' * 8}")
 
+    timings: dict[str, dict[str, float]] = {}
     polygon = utils_geo.bbox_to_poly(bbox)
 
-    # Stage: DuckDB query (network)
     nodes_df, ways_df = _timed(
         "duckdb_query_network",
         _pbf_reader._read_pbf_network_duckdb,
         polygon, "drive", None, PBF_PATH,
+        timings=timings,
     )
 
-    # Stage: Graph build
     G = _timed(
         "graph_build",
         graph._create_graph_from_dfs,
         nodes_df, ways_df, False,
+        timings=timings,
     )
 
-    # Stage: Graph simplify
     if len(G.edges) > 0:
-        _timed("graph_simplify", simplification.simplify_graph, G)
+        _timed("graph_simplify", simplification.simplify_graph, G, timings=timings)
 
-    # Stage: Distance calc
     if len(G.edges) > 0:
-        _timed("distance_calc", distance.add_edge_lengths, G)
+        _timed("distance_calc", distance.add_edge_lengths, G, timings=timings)
 
-    # Stage: DuckDB query (features)
     tags = {"building": True}
     try:
         nodes_f, ways_f, rels_f = _timed(
             "duckdb_query_features",
             _pbf_reader._read_pbf_features_duckdb,
             polygon, tags, PBF_PATH,
+            timings=timings,
         )
-
-        # Stage: Features Arrow table build
         _timed(
             "features_table",
             features._build_table,
             nodes_f, ways_f, rels_f, polygon, tags,
+            timings=timings,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  features skipped: {e}")
 
-    # Stage: End-to-end graph
     _duckdb.close()
     _timed(
         "end_to_end_graph",
         dx.graph_from_bbox,
         bbox, network_type="drive", simplify=True,
+        timings=timings,
     )
+    return timings
+
+
+def _git_sha() -> str:
+    """Return short git SHA for the current commit."""
+    return subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=Path(__file__).parent.parent,
+    ).decode().strip()
 
 
 def main() -> None:
-    """Run benchmarks."""
+    """Run benchmarks, optionally dumping JSON for tracking."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--track", action="store_true",
+        help="Emit JSON to benchmarks/results/<sha>.json",
+    )
+    args = parser.parse_args()
+
     if not PBF_PATH.exists():
         print(f"PBF file not found: {PBF_PATH}", file=sys.stderr)
         sys.exit(1)
@@ -109,11 +138,20 @@ def main() -> None:
     settings.pbf_file_path = str(PBF_PATH)
     settings.log_console = False
 
+    results: dict[str, dict[str, dict[str, float]]] = {}
     for name, *bbox_coords in SCALES:
         _duckdb.close()
-        bench_scale(name, tuple(bbox_coords))
+        results[name] = bench_scale_collect(name, tuple(bbox_coords))  # type: ignore[arg-type]
 
     _duckdb.close()
+
+    if args.track:
+        out_dir = Path(__file__).parent / "results"
+        out_dir.mkdir(exist_ok=True)
+        out_path = out_dir / f"{_git_sha()}.json"
+        out_path.write_text(json.dumps(results, indent=2))
+        print(f"\nWrote {out_path}")
+
     print("\nDone.")
 
 
