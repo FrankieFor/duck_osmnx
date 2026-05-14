@@ -16,6 +16,7 @@ from shapely import LineString
 from shapely import Point
 from shapely import STRtree
 
+from . import _rust
 from . import stats
 from . import utils
 from ._errors import GraphSimplificationError
@@ -537,6 +538,17 @@ def _trace_paths(
     nodes_flat
         Int64 array of row indices into ``adj.node_ids``.
     """
+    if _rust.HAVE_RUST:
+        # Native CSR DFS in Rust with the GIL released.
+        is_endpoint_u8 = np.zeros(adj.node_ids.size, dtype=np.uint8)
+        for e in endpoints:
+            is_endpoint_u8[adj.osmid_to_idx[e]] = 1
+        return _rust._simplify_topology(
+            np.ascontiguousarray(adj.succ_indptr, dtype=np.int64),
+            np.ascontiguousarray(adj.succ_indices, dtype=np.int64),
+            is_endpoint_u8,
+        )
+
     is_endpoint = np.zeros(adj.node_ids.size, dtype=bool)
     for e in endpoints:
         is_endpoint[adj.osmid_to_idx[e]] = True
@@ -1596,15 +1608,30 @@ def _consolidate_intersections_rebuild_graph(
     # STEP 2: assign each original node to the cluster polygon containing it
     osmids, node_xs, node_ys = _node_arrays(G)
     node_points = shapely.points(node_xs, node_ys)
-    tree = STRtree(cluster_geoms)
-    # query returns 2 x N array: [tree_idx, geom_idx]; nearest=False means
-    # we get all overlap pairs.
-    pairs = tree.query(node_points, predicate="within")
-    # pairs[0] = input (node) indices, pairs[1] = tree (cluster) indices
-    cluster_assignment = np.full(len(osmids), -1, dtype=np.int64)
-    cluster_assignment[pairs[0]] = pairs[1]
+
+    if _rust.HAVE_RUST and len(cluster_geoms) > 0:
+        # Native rstar PIP batch in Rust. WKB round-trip preserves shapely
+        # geometry exactly; nearest-cluster fallback still runs in Python
+        # for the rare boundary nodes.
+        cluster_wkbs = [bytes(b) for b in shapely.to_wkb(cluster_geoms)]
+        cluster_assignment = _rust._cluster_assign(
+            np.ascontiguousarray(node_xs, dtype=np.float64),
+            np.ascontiguousarray(node_ys, dtype=np.float64),
+            cluster_wkbs,
+        )
+        cluster_assignment = np.asarray(cluster_assignment, dtype=np.int64)
+    else:
+        tree = STRtree(cluster_geoms)
+        # query returns 2 x N array: [tree_idx, geom_idx]; nearest=False means
+        # we get all overlap pairs.
+        pairs = tree.query(node_points, predicate="within")
+        # pairs[0] = input (node) indices, pairs[1] = tree (cluster) indices
+        cluster_assignment = np.full(len(osmids), -1, dtype=np.int64)
+        cluster_assignment[pairs[0]] = pairs[1]
+
     if (cluster_assignment < 0).any():
         # handle nodes that fell on cluster boundaries (rare): nearest-cluster fallback
+        tree = STRtree(cluster_geoms)
         for missing_idx in np.where(cluster_assignment < 0)[0]:
             nearest = tree.nearest(node_points[missing_idx])
             cluster_assignment[missing_idx] = int(nearest)
