@@ -1,0 +1,92 @@
+{
+  "small": {
+    "duckdb_query_network": {
+      "time_s": 1.5055607079993933,
+      "peak_mb": 0.021070480346679688
+    },
+    "graph_build": {
+      "time_s": 0.03338354200241156,
+      "peak_mb": 2.2217941284179688
+    },
+    "graph_simplify": {
+      "time_s": 0.048761334001028445,
+      "peak_mb": 0.42621326446533203
+    },
+    "distance_calc": {
+      "time_s": 0.0017141670032287948,
+      "peak_mb": 0.04573822021484375
+    },
+    "duckdb_query_features": {
+      "time_s": 1.1339223329996457,
+      "peak_mb": 0.010730743408203125
+    },
+    "features_table": {
+      "time_s": 0.027574583000387065,
+      "peak_mb": 2.1782426834106445
+    },
+    "end_to_end_graph": {
+      "time_s": 2.4309438330019475,
+      "peak_mb": 11.44304370880127
+    }
+  },
+  "medium": {
+    "duckdb_query_network": {
+      "time_s": 1.683073208994756,
+      "peak_mb": 0.0047855377197265625
+    },
+    "graph_build": {
+      "time_s": 1.911578584004019,
+      "peak_mb": 132.28746223449707
+    },
+    "graph_simplify": {
+      "time_s": 3.1395018750044983,
+      "peak_mb": 24.81787109375
+    },
+    "distance_calc": {
+      "time_s": 0.0900896669991198,
+      "peak_mb": 2.967426300048828
+    },
+    "duckdb_query_features": {
+      "time_s": 1.4008527920013876,
+      "peak_mb": 0.010642051696777344
+    },
+    "features_table": {
+      "time_s": 0.211079749999044,
+      "peak_mb": 17.398536682128906
+    },
+    "end_to_end_graph": {
+      "time_s": 12.39498824999464,
+      "peak_mb": 200.45598316192627
+    }
+  },
+  "large": {
+    "duckdb_query_network": {
+      "time_s": 1.8541975000043749,
+      "peak_mb": 0.004992485046386719
+    },
+    "graph_build": {
+      "time_s": 13.651184041002125,
+      "peak_mb": 827.1685514450073
+    },
+    "graph_simplify": {
+      "time_s": 22.101437457997235,
+      "peak_mb": 156.7032985687256
+    },
+    "distance_calc": {
+      "time_s": 0.6591783339972608,
+      "peak_mb": 19.930042266845703
+    },
+    "duckdb_query_features": {
+      "time_s": 2.7881118329969468,
+      "peak_mb": 0.010873794555664062
+    },
+    "features_table": {
+      "time_s": 2.023838374996558,
+      "peak_mb": 145.07051467895508
+    },
+    "end_to_end_graph": {
+      "time_s": 62.25813004099473,
+      "peak_mb": 1124.015302658081
+    }
+  }
+}
